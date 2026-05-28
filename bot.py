@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SOLANA PUMP.FUN SNIPER BOT — RAILWAY + HELIUS        ║
-║    Entrée < 10K mcap | Sortie > 100K | Avant migration Raydium ║
+║        SOLANA PUMP.FUN SNIPER BOT — RAILWAY + HELIUS         ║
+║   Entrée < 10K mcap | Sortie > 100K | Avant migration Raydium ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -17,6 +17,7 @@ from collections import defaultdict
 import websockets
 from telegram import Bot
 from telegram.constants import ParseMode
+from fastapi import FastAPI
 
 # ──────────────────────────────────────────────────────────────
 # CONFIG (variables Railway / .env)
@@ -57,6 +58,9 @@ log = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
+# --- INITIALISATION FASTAPI POUR RAILWAY ---
+app = FastAPI()
+
 # Cache pour éviter les doublons
 alerted_tokens: dict[str, float] = {}   # mint -> timestamp
 token_data_cache: dict[str, dict] = {}  # mint -> data enrichi
@@ -92,13 +96,13 @@ async def fetch_dexscreener(session: aiohttp.ClientSession, mint: str) -> dict |
                 if pairs:
                     p = pairs[0]
                     return {
-                        "mcap":         float(p.get("fdv", 0)),
-                        "liquidity":    float(p.get("liquidity", {}).get("usd", 0)),
-                        "volume_5m":    float(p.get("volume", {}).get("m5", 0)),
-                        "volume_1h":    float(p.get("volume", {}).get("h1", 0)),
-                        "price_change_5m": float(p.get("priceChange", {}).get("m5", 0)),
-                        "buys_5m":      int(p.get("txns", {}).get("m5", {}).get("buys", 0)),
-                        "sells_5m":     int(p.get("txns", {}).get("m5", {}).get("sells", 0)),
+                        "mcap":         float(p.get("fdv", 0) or 0),
+                        "liquidity":    float(p.get("liquidity", {}).get("usd", 0) or 0),
+                        "volume_5m":    float(p.get("volume", {}).get("m5", 0) or 0),
+                        "volume_1h":    float(p.get("volume", {}).get("h1", 0) or 0),
+                        "price_change_5m": float(p.get("priceChange", {}).get("m5", 0) or 0),
+                        "buys_5m":      int(p.get("txns", {}).get("m5", {}).get("buys", 0) or 0),
+                        "sells_5m":     int(p.get("txns", {}).get("m5", {}).get("sells", 0) or 0),
                         "price_usd":    float(p.get("priceUsd", 0) or 0),
                         "pair_url":     p.get("url", ""),
                         "dex":          p.get("dexId", "pumpfun"),
@@ -124,12 +128,12 @@ async def fetch_helius_holders(session: aiohttp.ClientSession, mint: str) -> dic
                 if not accounts:
                     return {}
 
-                total_supply = sum(float(a.get("uiAmount", 0)) for a in accounts)
+                total_supply = sum(float(a.get("uiAmount", 0) or 0) for a in accounts)
                 if total_supply == 0:
                     return {}
 
-                top_holder_pct = (float(accounts[0].get("uiAmount", 0)) / total_supply * 100) if accounts else 0
-                top10_pct = sum(float(a.get("uiAmount", 0)) for a in accounts[:10]) / total_supply * 100
+                top_holder_pct = (float(accounts[0].get("uiAmount", 0) or 0) / total_supply * 100) if accounts else 0
+                top10_pct = sum(float(a.get("uiAmount", 0) or 0) for a in accounts[:10]) / total_supply * 100
 
                 return {
                     "holder_count":   len(accounts),
@@ -147,10 +151,7 @@ async def fetch_helius_holders(session: aiohttp.ClientSession, mint: str) -> dic
 # ══════════════════════════════════════════════════════════════
 
 def compute_signal_score(dex: dict, holders: dict, rug: dict, age_min: float) -> tuple[int, list[str]]:
-    """
-    Calcule un score de signal 0-100 et liste des signaux positifs.
-    Score ≥ 70 → alerte envoyée.
-    """
+    """Calcule un score de signal 0-100 et liste des signaux positifs."""
     score = 0
     signals = []
 
@@ -169,7 +170,7 @@ def compute_signal_score(dex: dict, holders: dict, rug: dict, age_min: float) ->
 
     # ── MCAP & ENTRÉE OPTIMALE (25 pts) ───────────────────
     mcap = dex.get("mcap", 0) if dex else 0
-    if 8_000 <= mcap <= 15_000:  score += 25; signals.append(f"🎯 MCap idéal ${mcap:,.0f}")
+    if 8_000 <= mcap <= 15_000:   score += 25; signals.append(f"🎯 MCap idéal ${mcap:,.0f}")
     elif 5_000 <= mcap <= 30_000: score += 15; signals.append(f"✅ MCap entrée ${mcap:,.0f}")
 
     # ── LIQUIDITÉ (15 pts) ────────────────────────────────
@@ -191,7 +192,7 @@ def compute_signal_score(dex: dict, holders: dict, rug: dict, age_min: float) ->
     if rug_score >= 85:  score += 15; signals.append(f"🛡️ RugCheck {rug_score}/100")
     elif rug_score >= 70: score += 8; signals.append(f"🛡️ RugCheck {rug_score}/100")
 
-    # ── ÂGÉ DU TOKEN ─────────────────────────────────────
+    # ── ÂGE DU TOKEN ─────────────────────────────────────
     if age_min <= 2:   signals.append(f"🕐 Token ultra-frais {age_min:.1f}min")
     elif age_min <= 5: signals.append(f"🕐 Token frais {age_min:.1f}min")
     else:              signals.append(f"⏱️ Age: {age_min:.1f}min")
@@ -200,11 +201,7 @@ def compute_signal_score(dex: dict, holders: dict, rug: dict, age_min: float) ->
 
 
 def apply_hard_filters(event: dict, dex: dict | None, holders: dict, rug: dict, age_min: float) -> tuple[bool, str]:
-    """
-    Filtres OBLIGATOIRES — si l'un échoue, pas d'alerte.
-    Retourne (pass, reason_if_fail).
-    """
-    # Âge
+    """Filtres OBLIGATOIRES — si l'un échoue, pas d'alerte."""
     if age_min > MAX_TOKEN_AGE_MIN:
         return False, f"token trop vieux ({age_min:.1f}min)"
 
@@ -247,7 +244,6 @@ def apply_hard_filters(event: dict, dex: dict | None, holders: dict, rug: dict, 
         risks = ", ".join(rug.get("risks", ["unknown"])[:3])
         return False, f"RugCheck KO (score={rug.get('score',0)}, {risks})"
 
-    # Vérifier qu'on n'a pas encore alerté ce token
     if event.get("mint") in alerted_tokens:
         return False, "déjà alerté"
 
@@ -277,7 +273,6 @@ def format_alert(event: dict, dex: dict, holders: dict, rug: dict,
     top10      = holders.get("top10_pct", "?")
     rug_score  = rug.get("score", "?")
 
-    # Barre de progression score
     bars = int(score / 10)
     bar  = "█" * bars + "░" * (10 - bars)
 
@@ -338,7 +333,6 @@ async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
     if age_min > MAX_TOKEN_AGE_MIN:
         return
 
-    # Fetch parallèle
     dex_data, holder_data, rug_data = await asyncio.gather(
         fetch_dexscreener(session, mint),
         fetch_helius_holders(session, mint),
@@ -349,19 +343,16 @@ async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
     holders = holder_data  if isinstance(holder_data, dict) else {}
     rug     = rug_data     if isinstance(rug_data, dict) else {"score": 0, "risks": [], "ok": False}
 
-    # Filtres obligatoires
     passed, reason = apply_hard_filters(event, dex, holders, rug, age_min)
     if not passed:
         log.debug(f"SKIP {mint[:8]} ({event.get('symbol','?')}): {reason}")
         return
 
-    # Score signal
     score, signals = compute_signal_score(dex, holders, rug, age_min)
     if score < 55:
         log.info(f"SCORE LOW {mint[:8]} ({event.get('symbol','?')}): {score}/100")
         return
 
-    # Envoyer l'alerte
     alerted_tokens[mint] = time.time()
     msg = format_alert(event, dex, holders, rug, age_min, score, signals)
     try:
@@ -404,7 +395,6 @@ async def connect_pumpfun(session: aiohttp.ClientSession, uri: str) -> None:
                 log.info("✅ WebSocket connected!")
                 reconnect_delay = 3
 
-                # S'abonner aux nouveaux tokens
                 subscribe_msg = json.dumps({"method": "subscribeNewToken"})
                 await ws.send(subscribe_msg)
                 log.info("Subscribed to newToken events")
@@ -413,10 +403,8 @@ async def connect_pumpfun(session: aiohttp.ClientSession, uri: str) -> None:
                     try:
                         if isinstance(raw_msg, bytes):
                             raw_msg = raw_msg.decode()
-                        # Ignorer les frames socket.io
                         if raw_msg.startswith("0") or raw_msg.startswith("2"):
                             continue
-                        # Strip préfixe socket.io numérique
                         for prefix in ("42", "43", "40", "41"):
                             if raw_msg.startswith(prefix):
                                 raw_msg = raw_msg[2:]
@@ -424,10 +412,8 @@ async def connect_pumpfun(session: aiohttp.ClientSession, uri: str) -> None:
 
                         data = json.loads(raw_msg)
 
-                        # Format PumpPortal
                         if isinstance(data, dict) and data.get("txType") == "create":
                             asyncio.create_task(process_token(session, data))
-                        # Format socket.io array: ["event", payload]
                         elif isinstance(data, list) and len(data) >= 2:
                             event_name, payload = data[0], data[1] if len(data) > 1 else {}
                             if event_name in ("create", "newToken") and isinstance(payload, dict):
@@ -462,10 +448,6 @@ async def cleanup_cache() -> None:
             log.info(f"Cache cleanup: removed {len(expired)} expired tokens")
 
 
-# ══════════════════════════════════════════════════════════════
-# STARTUP & MAIN LOOP
-# ══════════════════════════════════════════════════════════════
-
 async def send_startup_message() -> None:
     msg = f"""🤖 *Bot Sniper Solana démarré !*
 
@@ -483,15 +465,22 @@ async def send_startup_message() -> None:
 🌐 Source : Pump.fun WebSocket
 🔑 On-chain : Helius API
 ✅ _Avant migration Raydium (~$69K mcap)_"""
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=msg,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    log.info("Startup message sent")
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+        log.info("Startup message sent")
+    except Exception as e:
+        log.error(f"Failed to send startup message: {e}")
 
+# ══════════════════════════════════════════════════════════════
+# GESTION DES TÂCHES DE FOND AVEC FASTAPI
+# ══════════════════════════════════════════════════════════════
 
-async def main():
+@app.on_event("startup")
+async def startup_event():
+    """Démarre les boucles asynchrones au lancement de FastAPI sur Railway."""
+    asyncio.create_task(run_bot_logic())
+
+async def run_bot_logic():
     await send_startup_message()
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     timeout   = aiohttp.ClientTimeout(total=10)
@@ -502,6 +491,7 @@ async def main():
             cleanup_cache(),
         )
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+@app.get("/")
+async def root():
+    """Route de santé obligatoire pour Railway."""
+    return {"status": "online", "bot": "Solana Pump.fun Sniper"}

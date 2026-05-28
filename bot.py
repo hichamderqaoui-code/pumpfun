@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║        SOLANA PUMP.FUN SNIPER BOT — RAILWAY + HELIUS         ║
-║   Entrée libre (jusqu'à 35K) | Sortie > 100K | Flux Total    ║
+║  MCap < 35K | Top 10 < 29% | Flux Max (RugCheck Désactivé)   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -28,17 +28,17 @@ HELIUS_API_KEY   = os.environ["HELIUS_API_KEY"]
 
 # ── FILTRES VISUELS ET SÉCURITÉ ──────────────────────────────
 MIN_MCAP_USD          = 5_000      
-MAX_MCAP_ENTRY        = 35_000     # Augmenté pour voir tous les tokens de la curve
-TARGET_MCAP_EXIT      = 100_000    # Objectif final
+MAX_MCAP_ENTRY        = 35_000     # Gardé à 35K pour voir toute la curve
+TARGET_MCAP_EXIT      = 100_000    
 MAX_TOKEN_AGE_MIN     = 10         
 MIN_LIQUIDITY_SOL     = 5          
 MIN_VOLUME_5MIN_USD   = 1_500      
 MIN_HOLDER_COUNT      = 15         
 MAX_DEV_HOLD_PCT      = 20         
-MAX_TOP10_HOLD_PCT    = 60         
+MAX_TOP10_HOLD_PCT    = 29         # Filtre Axiom Pro strict
 MIN_BUY_SELL_RATIO    = 1.5        
 MIN_TX_PER_MIN        = 5          
-RUGCHECK_MIN_SCORE    = 70         
+RUGCHECK_MIN_SCORE    = 0          # PASSÉ À 0 : Filtre de blocage désactivé !
 REQUIRE_SOCIAL        = True       
 
 # ── ENDPOINTS ──────────────────────────────────────────────
@@ -66,10 +66,10 @@ async def fetch_rugcheck(session: aiohttp.ClientSession, mint: str) -> dict:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
             if r.status == 200:
                 data = await r.json()
-                return {"score": data.get("score", 0), "risks": [r["name"] for r in data.get("risks", [])], "ok": data.get("score", 0) >= RUGCHECK_MIN_SCORE}
+                return {"score": data.get("score", 0), "risks": [r["name"] for r in data.get("risks", [])], "ok": True}
     except Exception as e:
         log.debug(f"RugCheck error {mint[:8]}: {e}")
-    return {"score": 0, "risks": ["unavailable"], "ok": False}
+    return {"score": 0, "risks": ["unavailable"], "ok": True}
 
 async def fetch_dexscreener(session: aiohttp.ClientSession, mint: str) -> dict | None:
     try:
@@ -122,9 +122,11 @@ def apply_hard_filters(event: dict, dex: dict | None, holders: dict, rug: dict, 
     if mcap < MIN_MCAP_USD: return False, f"mcap low (${mcap:,.0f})"
     if mcap > MAX_MCAP_ENTRY: return False, f"mcap above limit (${mcap:,.0f})"
 
+    top10_pct = holders.get("top10_pct", 100)
+    if top10_pct > MAX_TOP10_HOLD_PCT: return False, f"top10 concentration too high ({top10_pct}%)"
+
     if (dex.get("liquidity", 0) / 150) < MIN_LIQUIDITY_SOL: return False, "low liquidity"
     if dex.get("volume_5m", 0) < MIN_VOLUME_5MIN_USD: return False, "low volume"
-    if not rug.get("ok", False): return False, "RugCheck KO"
     if event.get("mint") in alerted_tokens: return False, "already alerted"
     
     return True, ""
@@ -144,10 +146,10 @@ def format_alert(event: dict, dex: dict, holders: dict, rug: dict, age_min: floa
 ├ 📈 Vol 5min  : *${dex.get('volume_5m', 0):,.0f}*
 └ 🔁 B/S 5min  : *{dex.get('buys_5m', 0)}✅ / {dex.get('sells_5m', 0)}❌*
 
-👥 *HOLDERS & SECURITÉ*
+👥 *HOLDERS & SÉCURITÉ*
 ├ Nb Wallets  : *{holders.get('holder_count', '?')}*
-├ Top 10 Hold : *{holders.get('top10_pct', '?')}%*
-└ RugCheck    : *{rug.get('score', '?')}/100*
+├ 🎯 Top 10 Hold : *{holders.get('top10_pct', '?')}%* (Filtre: <29%)
+└ 🔍 Score RugCheck : *{rug.get('score', '?')}/100* (Info seule)
 
 ⏱️ Âge : {age_min:.1f} min
 ━━━━━━━━━━━━━━━━━━━━━
@@ -172,7 +174,7 @@ async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
     
     if not isinstance(dex, dict): return
     holders = holders if isinstance(holders, dict) else {}
-    rug = rug if isinstance(rug, dict) else {"score": 0, "ok": False}
+    rug = rug if isinstance(rug, dict) else {"score": 0, "ok": True}
 
     passed, reason = apply_hard_filters(event, dex, holders, rug, age_min)
     if not passed: return
@@ -216,7 +218,7 @@ async def startup_event():
 
 async def run_bot_logic():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔄 *Mise à jour du bot effectuée : Plafond MCap relevé à $35K !*", parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔄 *Mise à jour effectuée : Filtre de note RugCheck désactivé ! Prépare-toi aux notifications.*", parse_mode=ParseMode.MARKDOWN)
     except: pass
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:

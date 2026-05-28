@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║        SOLANA PUMP.FUN SNIPER BOT — RAILWAY + HELIUS         ║
-║   Entrée < 10K mcap | Sortie > 33K  | Avant migration Raydium ║
+║   Entrée ~ 10K mcap | Sortie > 100K | Vise les Moonshots     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -26,14 +26,14 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HELIUS_API_KEY   = os.environ["HELIUS_API_KEY"]   # https://helius.dev
 
-# ── FILTRES PRINCIPAUX ──────────────────────────────────────
-MIN_MCAP_USD          = 5_000      # ne pas entrer trop tôt
-MAX_MCAP_ENTRY        = 30_000     # seuil max d'entrée (< 30K)
-TARGET_MCAP_EXIT      = 33_000     # objectif de sortie (migration)
+# ── FILTRES PRINCIPAUX (STRATÉGIE ENTRÉE 10K / SORTIE 100K) ──
+MIN_MCAP_USD          = 5_000      # ne pas entrer trop tôt (Snipe safe)
+MAX_MCAP_ENTRY        = 15_000     # cap max pour choper la zone des ~10K mcap
+TARGET_MCAP_EXIT      = 100_000    # TON OBJECTIF DE SORTIE (Target x10)
 MAX_TOKEN_AGE_MIN     = 10         # token < 10 minutes
-MIN_LIQUIDITY_SOL     = 10         # liquidité min en SOL
-MIN_VOLUME_5MIN_USD   = 2_000      # volume 5 min minimum
-MIN_HOLDER_COUNT      = 20         # nb wallets uniques minimum
+MIN_LIQUIDITY_SOL     = 5          # liquidité min adaptée pour un mcap à 10K
+MIN_VOLUME_5MIN_USD   = 1_500      # volume 5 min minimum
+MIN_HOLDER_COUNT      = 15         # nb wallets uniques minimum à ce stade
 MAX_DEV_HOLD_PCT      = 20         # dev ne détient pas > 20%
 MAX_TOP10_HOLD_PCT    = 60         # top 10 ne concentrent pas > 60%
 MIN_BUY_SELL_RATIO    = 1.5        # plus d'acheteurs que vendeurs
@@ -170,14 +170,14 @@ def compute_signal_score(dex: dict, holders: dict, rug: dict, age_min: float) ->
 
     # ── MCAP & ENTRÉE OPTIMALE (25 pts) ───────────────────
     mcap = dex.get("mcap", 0) if dex else 0
-    if 8_000 <= mcap <= 15_000:   score += 25; signals.append(f"🎯 MCap idéal ${mcap:,.0f}")
-    elif 5_000 <= mcap <= 30_000: score += 15; signals.append(f"✅ MCap entrée ${mcap:,.0f}")
+    if 8_000 <= mcap <= 12_000:   score += 25; signals.append(f"🎯 MCap idéal proche 10K (${mcap:,.0f})")
+    elif 5_000 <= mcap <= 15_000: score += 15; signals.append(f"✅ MCap entrée précoce (${mcap:,.0f})")
 
     # ── LIQUIDITÉ (15 pts) ────────────────────────────────
     liq = dex.get("liquidity", 0) if dex else 0
     liq_sol = liq / 150  # estimation SOL
-    if liq_sol >= 30:   score += 15; signals.append(f"💧 Liquidité forte {liq_sol:.0f} SOL")
-    elif liq_sol >= 10: score += 8;  signals.append(f"💧 Liquidité ${liq:,.0f}")
+    if liq_sol >= 15:   score += 15; signals.append(f"💧 Liquidité forte {liq_sol:.0f} SOL")
+    elif liq_sol >= 5:  score += 8;  signals.append(f"💧 Liquidité ${liq:,.0f}")
 
     # ── DISTRIBUTION HOLDERS (15 pts) ─────────────────────
     if holders:
@@ -185,7 +185,7 @@ def compute_signal_score(dex: dict, holders: dict, rug: dict, age_min: float) ->
         if top10 <= 40:   score += 15; signals.append(f"👥 Distrib. saine top10={top10:.0f}%")
         elif top10 <= 60: score += 8;  signals.append(f"👥 Top 10 = {top10:.0f}%")
         nb = holders.get("holder_count", 0)
-        if nb >= 50: signals.append(f"👥 {nb} holders")
+        if nb >= 30: signals.append(f"👥 {nb} holders")
 
     # ── SÉCURITÉ RUGCHECK (15 pts) ───────────────────────
     rug_score = rug.get("score", 0)
@@ -212,7 +212,7 @@ def apply_hard_filters(event: dict, dex: dict | None, holders: dict, rug: dict, 
     if mcap < MIN_MCAP_USD:
         return False, f"mcap trop faible (${mcap:,.0f})"
     if mcap > MAX_MCAP_ENTRY:
-        return False, f"mcap trop élevé pour entrée (${mcap:,.0f})"
+        return False, f"mcap trop élevé pour ta stratégie 10K (${mcap:,.0f})"
 
     liq = dex.get("liquidity", 0)
     liq_sol = liq / 150
@@ -278,14 +278,14 @@ def format_alert(event: dict, dex: dict, holders: dict, rug: dict,
 
     signals_text = "\n".join(f"  {s}" for s in signals[:6])
 
-    msg = f"""🚨 *SIGNAL SNIPER* — `{symbol}`
+    msg = f"""🚨 *SIGNAL SNIPER 🚀 ZONE 10K* — `{symbol}`
 
 📛 *{name}*
 `{mint[:20]}...`
 
 ━━━━━━━━━━━━━━━━━━━━━
 📊 *MÉTRIQUES*
-├ 💰 MCap     : *${mcap:,.0f}*
+├ 💰 MCap     : *${mcap:,.0f}* (Cible d'entrée validée)
 ├ 💧 Liquidité : *${liq:,.0f}*
 ├ 📈 Vol 5min  : *${vol5m:,.0f}*
 ├ 🔁 B/S 5min  : *{buys}✅ / {sells}❌*
@@ -311,8 +311,8 @@ def format_alert(event: dict, dex: dict, holders: dict, rug: dict,
 
 ━━━━━━━━━━━━━━━━━━━━━
 🎯 Entrée    : *~${mcap:,.0f}* mcap
-🏁 Objectif  : *$33K+ mcap*
-⚠️ Migration Raydium vers *~$33K* mcap
+🏁 Objectif MOONSHOT : *${TARGET_MCAP_EXIT:,.0f}+ mcap* (x10+)
+⚠️ _Migration Raydium technique à ~$33K mcap_
 
 🔗 [Pump.fun](https://pump.fun/{mint}) | [DexScreener]({pair_url}) | [Birdeye](https://birdeye.so/token/{mint}) | [RugCheck](https://rugcheck.xyz/tokens/{mint})
 
@@ -449,11 +449,11 @@ async def cleanup_cache() -> None:
 
 
 async def send_startup_message() -> None:
-    msg = f"""🤖 *Bot Sniper Solana démarré !*
+    msg = f"""🤖 *Bot Sniper Solana démarré ! (Stratégie Moonshot)*
 
 ⚙️ *Configuration active :*
-├ MCap entrée   : ${MIN_MCAP_USD:,} – ${MAX_MCAP_ENTRY:,}
-├ Objectif      : ${TARGET_MCAP_EXIT:,}+
+├ MCap entrée   : ${MIN_MCAP_USD:,} – ${MAX_MCAP_ENTRY:,} (Focus ~10K)
+├ Objectif exit : *${TARGET_MCAP_EXIT:,}+* (Target x10)
 ├ Age max token : {MAX_TOKEN_AGE_MIN} min
 ├ Liquidité min : {MIN_LIQUIDITY_SOL} SOL
 ├ Volume 5m min : ${MIN_VOLUME_5MIN_USD:,}
@@ -464,7 +464,7 @@ async def send_startup_message() -> None:
 
 🌐 Source : Pump.fun WebSocket
 🔑 On-chain : Helius API
-✅ _Avant migration Raydium (~$33K mcap)_"""
+🚀 _Filtres calibrés pour dénicher les pépites tôt !_"""
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
         log.info("Startup message sent")

@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        SOLANA PUMP.FUN SNIPER BOT — RAILWAY + HELIUS         ║
-║   Filtre Temporisé 45s | Top 10 < 29% | Sécurisé & Calme     ║
+║        SOLANA PUMP.FUN SNIPER BOT — VERSION FINALE           ║
+║   Filtre Top 10 Réel (Hors Curve) < 29% | Sécurisé & Précis  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -16,22 +16,21 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from fastapi import FastAPI
 
-# ──────────────────────────────────────────────────────────────
-# CONFIG (variables Railway / .env)
-# ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HELIUS_API_KEY   = os.environ["HELIUS_API_KEY"]
 
-# ── FILTRES ADAPTÉS POUR UN FLUX PROPRE ──────────────────────
-MAX_TOP10_HOLD_PCT    = 29         # Ton filtre Axiom Pro strict
-MIN_MCAP_USD          = 7_000      # Élimine les tokens mort-nés instantanément
-WAIT_BEFORE_CHECK_SEC = 45         # Laisse 45s aux holders pour se diluer et à l'admin pour buy
+# ── FILTRES CHIRURGICAUX AXIOM PRO ──────────────────────────
+MAX_TOP10_HOLD_PCT    = 29         # Limite stricte sur les vrais acheteurs
+MIN_MCAP_USD          = 7_000      # Élimine les lancements fantômes
+WAIT_BEFORE_CHECK_SEC = 45         # Laisse le temps au marché de se distribuer
 
-# ── ENDPOINTS ──────────────────────────────────────────────
 PUMPFUN_WS_PRIMARY    = "wss://pumpportal.fun/api/data"
 HELIUS_RPC            = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 DEXSCREENER_API       = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+
+# Adresse officielle de la Bonding Curve globale de Pump.fun
+PUMP_BONDING_CURVE_AUTHORITY = "5Q544fNpGWDbwS7oSyLEmu67JscBePySTWvKc4o9u8nd"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -69,30 +68,29 @@ async def fetch_helius_holders(session: aiohttp.ClientSession, mint: str) -> dic
                 data = await r.json()
                 accounts = data.get("result", {}).get("value", [])
                 if accounts:
-                    total_supply = sum(float(a.get("uiAmount", 0) or 0) for a in accounts)
-                    if total_supply > 0:
-                        # Exclure le plus gros wallet s'il s'agit de la bonding curve à 100% non mise à jour
-                        top10_pct = sum(float(a.get("uiAmount", 0) or 0) for a in accounts[:10]) / total_supply * 100
-                        return {"holder_count": len(accounts), "top10_pct": round(top10_pct, 1)}
+                    # On filtre pour ENLEVER la bonding curve du calcul de la supply humaine
+                    trader_accounts = [a for a in accounts if a.get("address") != PUMP_BONDING_CURVE_AUTHORITY]
+                    
+                    total_trader_supply = sum(float(a.get("uiAmount", 0) or 0) for a in trader_accounts)
+                    
+                    if total_trader_supply > 0:
+                        # Top 10 basé uniquement sur les wallets des traders
+                        top10_pct = sum(float(a.get("uiAmount", 0) or 0) for a in trader_accounts[:10]) / total_trader_supply * 100
+                        return {"holder_count": len(trader_accounts), "top10_pct": round(top10_pct, 1)}
     except: pass
     return {"holder_count": 0, "top10_pct": 100}
 
 # ══════════════════════════════════════════════════════════════
-# FILTRAGE CHIRURGICAL AFTER-MARKET
+# LOGIQUE DE SÉLECTION
 # ══════════════════════════════════════════════════════════════
 
 async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
     mint = event.get("mint")
-    if not mint: return
-
-    # 1. BARRIÈRE ANTI-DOUBLON STRICTE ET IMMÉDIATE
-    if mint in alerted_tokens: return
+    if not mint or mint in alerted_tokens: return
     alerted_tokens[mint] = time.time()
 
-    # 2. TEMPORISATION : On attend 45 secondes que le marché bouge
     await asyncio.sleep(WAIT_BEFORE_CHECK_SEC)
 
-    # 3. FETCH DATA EN PARALLÈLE
     dex, holders = await asyncio.gather(
         fetch_dexscreener(session, mint),
         fetch_helius_holders(session, mint),
@@ -102,44 +100,41 @@ async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
     dex = dex if isinstance(dex, dict) else None
     holders = holders if isinstance(holders, dict) else {"top10_pct": 100, "holder_count": 0}
 
-    # 4. FILTRAGE DÉFINITIF
     mcap = dex.get("mcap", 0) if dex else 0
     top10_pct = holders.get("top10_pct", 100)
 
-    # Filtre de capitalisation minimal pour écarter les rug instantanés
     if mcap < MIN_MCAP_USD:
         log.info(f"❌ Rejeté {event.get('symbol')} : Mcap trop bas (${mcap:,.0f})")
         return
 
-    # Filtre strict de ton Top 10 Axiom Pro
     if top10_pct > MAX_TOP10_HOLD_PCT:
-        log.info(f"❌ Rejeté {event.get('symbol')} : Concentration trop haute ({top10_pct}%)")
+        log.info(f"❌ Rejeté {event.get('symbol')} : Vrai Top 10 trop concentré ({top10_pct}%)")
         return
 
-    # 5. ENVOI DE L'ALERTE QUALIFIÉE
-    msg = f"""🚀 *PÉPITE VALIDÉE (<29% TOP 10)* — `{event.get('symbol', '?')}`
-`{mint}`
+    # TOUT EST BON : ENVOI DU SIGNAL QUALIFIÉ
+    msg = f"""🎯 *ALERTE PÉPITE VALIDÉE (<29% Top 10)*
+• *Jeton :* {event.get('name', '?')} ({event.get('symbol', '?')})
+• *Mint :* `{mint}`
 
 ━━━━━━━━━━━━━━━━━━━━━
-📊 *MARKET DATA (Après {WAIT_BEFORE_CHECK_SEC}s)*
+📊 *MARKET DATA (à {WAIT_BEFORE_CHECK_SEC}s)*
 ├ 💰 Market Cap : *${mcap:,.0f}*
 ├ 💧 Liquidité : *${dex.get('liquidity', 0):,.0f}*
 
-👥 *HOLDERS*
-├ 🎯 Top 10 Hold : *{top10_pct}%* (Filtre: <29%)
-└ 👥 Total Wallets : *{holders.get('holder_count', '?')}*
+👥 *DISTRIBUTION TRADERS (Hors Curve)*
+├ 🎯 Top 10 Holders : *{top10_pct}%* └ 👥 Wallets Actifs : *{holders.get('holder_count', '?')}*
 
 ━━━━━━━━━━━━━━━━━━━━━
 🔗 [Pump.fun](https://pump.fun/{mint}) | [DexScreener]({dex.get('pair_url', '') if dex else ''})"""
     
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-        log.info(f"✅ Alerte de qualité envoyée pour {event.get('symbol')}")
+        log.info(f"🚀 SIGNAL ENVOYÉ pour {event.get('symbol')}")
     except Exception as e:
         log.error(f"Erreur Telegram: {e}")
 
 # ══════════════════════════════════════════════════════════════
-# CONNEXION
+# INITIALISATION
 # ══════════════════════════════════════════════════════════════
 
 async def connect_pumpfun(session: aiohttp.ClientSession):

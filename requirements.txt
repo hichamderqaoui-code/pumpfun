@@ -2,4 +2,4 @@ fastapi
 uvicorn
 httpx
 python-telegram-bot==21.6
-aiohttp==3.9.5
+websockets==12.0

@@ -1,0 +1,10 @@
+# ───────────────────────────────────────────
+# .gitignore — NE PAS committer les secrets
+# ───────────────────────────────────────────
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.log

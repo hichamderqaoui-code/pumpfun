@@ -3,3 +3,4 @@ uvicorn
 httpx
 python-telegram-bot==21.6
 websockets==12.0
+aiohttp==3.9.5

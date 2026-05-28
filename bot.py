@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║        SOLANA PUMP.FUN SNIPER BOT — RAILWAY + HELIUS         ║
-║   Entrée < 10K mcap | Sortie > 100K | Avant migration Raydium ║
+║   Entrée < 10K mcap | Sortie > 33K  | Avant migration Raydium ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -29,7 +29,7 @@ HELIUS_API_KEY   = os.environ["HELIUS_API_KEY"]   # https://helius.dev
 # ── FILTRES PRINCIPAUX ──────────────────────────────────────
 MIN_MCAP_USD          = 5_000      # ne pas entrer trop tôt
 MAX_MCAP_ENTRY        = 30_000     # seuil max d'entrée (< 30K)
-TARGET_MCAP_EXIT      = 100_000    # objectif de sortie
+TARGET_MCAP_EXIT      = 33_000     # objectif de sortie (migration)
 MAX_TOKEN_AGE_MIN     = 10         # token < 10 minutes
 MIN_LIQUIDITY_SOL     = 10         # liquidité min en SOL
 MIN_VOLUME_5MIN_USD   = 2_000      # volume 5 min minimum
@@ -47,7 +47,7 @@ PUMPFUN_WS_FALLBACK   = "wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=
 RUGCHECK_API          = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 HELIUS_RPC            = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 DEXSCREENER_API       = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
-RAYDIUM_MIGRATION_CAP = 69_000    # seuil officiel migration Raydium (~69K bonding curve)
+RAYDIUM_MIGRATION_CAP = 33_000    # seuil réel de migration Raydium (~33K mcap réel)
 
 # ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -311,8 +311,8 @@ def format_alert(event: dict, dex: dict, holders: dict, rug: dict,
 
 ━━━━━━━━━━━━━━━━━━━━━
 🎯 Entrée    : *~${mcap:,.0f}* mcap
-🏁 Objectif  : *$100K+ mcap*
-⚠️ Migration Raydium vers *~$69K* mcap
+🏁 Objectif  : *$33K+ mcap*
+⚠️ Migration Raydium vers *~$33K* mcap
 
 🔗 [Pump.fun](https://pump.fun/{mint}) | [DexScreener]({pair_url}) | [Birdeye](https://birdeye.so/token/{mint}) | [RugCheck](https://rugcheck.xyz/tokens/{mint})
 
@@ -464,7 +464,7 @@ async def send_startup_message() -> None:
 
 🌐 Source : Pump.fun WebSocket
 🔑 On-chain : Helius API
-✅ _Avant migration Raydium (~$69K mcap)_"""
+✅ _Avant migration Raydium (~$33K mcap)_"""
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
         log.info("Startup message sent")

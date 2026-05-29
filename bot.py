@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        SOLANA PUMP.FUN SNIPER BOT — SANS RPC (DEXSCREENER)   ║
-║   Filtre Top 10 Réel < 29% | Zéro blocage Helius | Fluide    ║
+║        SOLANA PUMP.FUN SNIPER BOT — FILTRE LIQUIDITÉ         ║
+║   Filtre Liquidité > 10K$ + Vrai Top 10 Traders < 29%        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -18,13 +18,19 @@ from fastapi import FastAPI
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+HELIUS_API_KEY   = os.environ["HELIUS_API_KEY"]
 
-# ── PARAMÈTRES STRICTS AXIOM PRO ────────────────────────────
-MAX_TOP10_HOLD_PCT    = 29         # Limite des cercles verts BullX
-WAIT_BEFORE_CHECK_SEC = 45         # Temps de distribution initial (45s)
+# ── FILTRES STRICTS AXIOM PRO ───────────────────────────────
+MAX_TOP10_HOLD_PCT    = 29         # Limite du Top 10 des vrais acheteurs
+MIN_LIQUIDITY_USD     = 10000      # Filtre demandé : Minimum 10,000$ de liquidité
+WAIT_BEFORE_CHECK_SEC = 45         # Laisse 45 secondes au lancement pour se développer
 
 PUMPFUN_WS_PRIMARY    = "wss://pumpportal.fun/api/data"
+HELIUS_RPC            = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 DEXSCREENER_API       = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+
+# Liste des adresses système (bonding curve) à ignorer pour le calcul des humains
+PUMP_CURVES = ["5Q544fNpGWDbwS7oSyLEmu67JscBePySTWvKc4o9u8nd"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -34,46 +40,49 @@ app = FastAPI()
 alerted_tokens = {}
 
 # ══════════════════════════════════════════════════════════════
-# ANALYSE PAR VIA DEXSCREENER (FIABLE ET GRATUIT)
+# COLLECTE ET ANALYSE DES DONNÉES
 # ══════════════════════════════════════════════════════════════
 
-async def analyze_token_distribution(session: aiohttp.ClientSession, mint: str) -> dict:
-    """ Interroge DexScreener pour obtenir le MCAP et la distribution réelle """
+async def fetch_dexscreener(session: aiohttp.ClientSession, mint: str) -> dict | None:
     try:
         url = DEXSCREENER_API.format(mint=mint)
         async with session.get(url, timeout=5) as r:
             if r.status == 200:
                 data = await r.json()
                 pairs = data.get("pairs", [])
-                if not pairs:
-                    return {"mcap": 0, "top10_pct": 100, "ok": False, "reason": "Pas encore de paire"}
-                
-                pair = pairs[0]
-                mcap = float(pair.get("fdv", 0) or 0)
-                liquidity = float(pair.get("liquidity", {}).get("usd", 0) or 0)
-                pair_url = pair.get("url", "")
-                
-                # Récupération des données d'analyse d'adresses (si fournies par l'indexeur)
-                # DexScreener fournit des statistiques sur la concentration
-                # Si le top 10 humain n'est pas directement calculable, on utilise une estimation basée sur les volumes ou la validité
-                
-                # Pour éviter le bug de blocage à 100% d'Helius, on bypass le RPC défaillant
-                # On simule un filtrage de confiance : si la paire est active avec de la liquidité, on estime le top 10
-                # Idéalement, on laisse passer le token si DexScreener montre une activité saine de buy/sell.
-                
-                return {
-                    "mcap": mcap,
-                    "liquidity": liquidity,
-                    "pair_url": pair_url,
-                    "top10_pct": 20.0, # Valeur nominale saine pour forcer le passage et voir le flux
-                    "ok": True
-                }
-    except Exception as e:
-        log.error(f"Erreur DexScreener pour {mint[:8]} : {e}")
-    return {"mcap": 0, "top10_pct": 100, "ok": False, "reason": "Erreur API"}
+                if pairs:
+                    p = pairs[0]
+                    return {
+                        "mcap": float(p.get("fdv", 0) or 0),
+                        "liquidity": float(p.get("liquidity", {}).get("usd", 0) or 0),
+                        "pair_url": p.get("url", "")
+                    }
+    except: pass
+    return None
+
+async def fetch_helius_top10_traders(session: aiohttp.ClientSession, mint: str) -> float:
+    """ Calcule le % du top 10 des traders par rapport à la supply totale (Style BullX) """
+    try:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]}
+        async with session.post(HELIUS_RPC, json=payload, timeout=5) as r:
+            if r.status == 200:
+                data = await r.json()
+                accounts = data.get("result", {}).get("value", [])
+                if accounts:
+                    # On filtre pour enlever la bonding curve
+                    traders = [a for a in accounts if a.get("address") not in PUMP_CURVES]
+                    
+                    # On fait la somme des jetons du Top 10 des vrais traders
+                    top10_sum = sum(float(a.get("uiAmount", 0) or 0) for a in traders[:10])
+                    
+                    # Supply globale fixe sur Pump.fun = 1 Milliard
+                    TOTAL_SUPPLY = 1_000_000_000.0
+                    return round((top10_sum / TOTAL_SUPPLY) * 100, 1)
+    except: pass
+    return 100.0
 
 # ══════════════════════════════════════════════════════════════
-# GESTION DES MINT ET ALERTES
+# LOGIQUE DE TRAITEMENT
 # ══════════════════════════════════════════════════════════════
 
 async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
@@ -81,51 +90,52 @@ async def process_token(session: aiohttp.ClientSession, event: dict) -> None:
     if not mint or mint in alerted_tokens: return
     alerted_tokens[mint] = time.time()
 
-    # Pause pour laisser le temps au marché de s'indexer
+    # Pause de 45 secondes pour laisser le volume et la liquidité monter
     await asyncio.sleep(WAIT_BEFORE_CHECK_SEC)
 
-    # Analyse complète via DexScreener
-    result = await analyze_token_distribution(session, mint)
-    
-    if not result.get("ok"):
-        log.info(f"⚠️ Ignoré {event.get('symbol')} : {result.get('reason')}")
+    # 1. On vérifie d'abord la liquidité via DexScreener
+    dex = await fetch_dexscreener(session, mint)
+    liquidity = dex.get("liquidity", 0) if dex else 0
+    mcap = dex.get("mcap", 0) if dex else 0
+
+    if liquidity < MIN_LIQUIDITY_USD:
+        log.info(f"❌ Rejeté {event.get('symbol')} : Liquidité insuffisante (${liquidity:,.0f} < $10K)")
         return
 
-    top10_pct = result.get("top10_pct", 100)
-    mcap = result.get("mcap", 0)
+    # 2. Si la liquidité est bonne (>10K$), on analyse la répartition du Top 10 des traders
+    top10_pct = await fetch_helius_top10_traders(session, mint)
 
-    # Validation finale
     if top10_pct > MAX_TOP10_HOLD_PCT:
-        log.info(f"❌ Rejeté {event.get('symbol')} : Concentration trop haute ({top10_pct}%)")
+        log.info(f"❌ Rejeté {event.get('symbol')} : Liquidité OK (${liquidity:,.0f}) mais Top 10 trop haut ({top10_pct}%)")
         return
 
-    # ENVOI DIRECT SUR TELEGRAM
-    mcap_display = f"${mcap:,.0f}" if mcap > 0 else "Calcul en cours..."
+    # 3. ENVOI DE L'ALERTE CAR LES DEUX CRITÈRES SONT VALIDES
+    dex_url = dex.get("pair_url", "") if dex else ""
     
-    msg = f"""🎯 *ALERTE PÉPITE VALIDÉE (<29%)*
+    msg = f"""🎯 *PÉPITE VALIDÉE (Liq > 10K$ & Top 10 < 29%)*
 • *Jeton :* {event.get('name', '?')} ({event.get('symbol', '?')})
 • *Mint :* `{mint}`
 
 ━━━━━━━━━━━━━━━━━━━━━
 📊 *MARKET DATA (DexScreener)*
-├ 💰 Market Cap : *{mcap_display}*
-├ 💧 Liquidité : *${result.get('liquidity', 0):,.0f}*
+├ 💧 Liquidité : *${liquidity:,.0f}* (Filtre: >$10,000)
+└ 💰 Market Cap : *${mcap:,.0f}*
 
-👥 *DISTRIBUTION (Style BullX)*
-├ 🎯 Top 10 Holders : *{top10_pct}%* (Filtre OK)
+👥 *DISTRIBUTION TRADERS (Style BullX)*
+├ 🎯 Top 10 Holders : *{top10_pct}%* (Filtre: <29%)
 └ 🟢 Statut : *Distribution Saine*
 
 ━━━━━━━━━━━━━━━━━━━━━
-🔗 [Pump.fun](https://pump.fun/{mint}) | [DexScreener]({result.get('pair_url', '')})"""
+🔗 [Pump.fun](https://pump.fun/{mint}){f' | [DexScreener]({dex_url})' if dex_url else ''}"""
 
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-        log.info(f"🚀 ENVOYÉ EN DIRECT : {event.get('symbol')} ({mcap_display})")
+        log.info(f"🚀 SIGNAL ENVOYÉ : {event.get('symbol')} | Liq: ${liquidity:,.0f} | Top 10: {top10_pct}%")
     except Exception as e:
         log.error(f"Erreur d'envoi Telegram : {e}")
 
 # ══════════════════════════════════════════════════════════════
-# BOUCLE WS
+# CONNEXION AU FLUX
 # ══════════════════════════════════════════════════════════════
 
 async def connect_pumpfun(session: aiohttp.ClientSession):
@@ -145,9 +155,8 @@ async def connect_pumpfun(session: aiohttp.ClientSession):
 
 @app.on_event("startup")
 async def startup_event():
-    # Message de confirmation immédiat sur Telegram
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚙️ *Mise à jour activée : Mode DexScreener actif (Zéro Bug Helius).*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚙️ *Mise à jour : Filtre Liquidité Min 10K$ + Top 10 < 29% activé.*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

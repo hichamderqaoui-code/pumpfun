@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        SOLANA PUMP.FUN SNIPER BOT — AXIOM PRO LINK v12.1     ║
-║    Zéro Simulation — Intégration du Lien Axiom Pro Direct    ║
+║        SOLANA PUMP.FUN SNIPER BOT — AXIOM PRO LINK v12.2     ║
+║    Correction Syntaxe F-String Liens — Production Stable     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -60,7 +60,11 @@ async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, el
     minutes = int(elapsed_seconds // 60)
     seconds = int(elapsed_seconds % 60)
 
-    # Ajout du lien Axiom Trade / Pro mis en valeur dans la section liens
+    # Liens propres générés en amont pour éviter les conflits d'accolades dans le bloc texte
+    link_axiom = f"https://axiom.trade/token/{mint}"
+    link_dex = f"https://dexscreener.com/solana/{mint}"
+    link_pump = f"https://pump.fun/{mint}"
+
     msg = (
         "🎯 *ALERTE PUMP 10K ATTEINT (<10 MIN)*\n"
         f"• *Jeton :* {clean_name} ({clean_symbol})\n"
@@ -71,4 +75,87 @@ async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, el
         "├ ⏱️ Statut : *Filtre <10 min Validé*\n"
         f"└ ⏱️ Temps écoulé : *{minutes}m {seconds}s*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 [Axiom Pro](https://axiom.trade/token/{mint}) | [DexScreener](https://dexscreener.com/solana/{mint}) | [Pump.fun](https
+        f"🔗 [Axiom Pro]({link_axiom}) | [DexScreener]({link_dex}) | [Pump.fun]({link_pump})"
+    )
+    
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        log.info(f"🔥 [ALERTE RÉELLE] Signal envoyé pour {clean_symbol} (${mcap:,.0f})")
+    except Exception as e:
+        log.error(f"Erreur d'envoi Telegram : {e}")
+
+# ══════════════════════════════════════════════════════════════
+# MONITORING FILTRÉ DE O À 10 MINUTES
+# ══════════════════════════════════════════════════════════════
+
+async def monitor_token(session: aiohttp.ClientSession, mint: str, symbol: str, name: str):
+    if not mint or mint in alerted_tokens:
+        return
+    
+    alerted_tokens[mint] = {"status": "monitoring", "start_time": time.time()}
+    max_loops = int((MAX_MONITOR_MINUTES * 60) // CHECK_INTERVAL_SEC)
+    
+    log.info(f"👀 [Tracking Réel] Début des 10 min de surveillance pour {symbol}")
+
+    for _ in range(max_loops):
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
+        
+        if alerted_tokens.get(mint) == "ALERTED":
+            return
+
+        elapsed = int(time.time() - alerted_tokens[mint]["start_time"])
+        real_mcap = await get_real_market_cap(session, mint)
+        
+        if real_mcap <= 0:
+            continue
+
+        log.info(f"⏱️ {symbol} ({elapsed}s / 600s) -> Vrai MCAP : ${real_mcap:,.0f}")
+
+        if real_mcap < TARGET_MARKET_CAP_USD:
+            continue
+
+        alerted_tokens[mint] = "ALERTED"
+        await send_telegram_alert(session, mint, symbol, name, real_mcap, elapsed)
+        return
+
+# ══════════════════════════════════════════════════════════════
+# CONNEXION FLUX WEBSOCKET PUMP.FUN
+# ══════════════════════════════════════════════════════════════
+
+async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
+    while True:
+        try:
+            async with websockets.connect(PUMPFUN_WS_PRIMARY, ping_interval=20) as ws:
+                log.info("✅ Connecté au flux de création Pump.fun !")
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                async for raw_msg in ws:
+                    try:
+                        data = json.loads(raw_msg)
+                        if isinstance(data, dict) and data.get("txType") == "create":
+                            mint = data.get("mint")
+                            symbol = data.get("symbol", "?")
+                            name = data.get("name", "?")
+                            asyncio.create_task(monitor_token(session, mint, symbol, name))
+                    except: pass
+        except Exception as e:
+            log.error(f"Erreur Flux WebSocket : {e}")
+            await asyncio.sleep(3)
+
+# ══════════════════════════════════════════════════════════════
+# ENTRÉE FASTAPI
+# ══════════════════════════════════════════════════════════════
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v12.2 : Correctif des liens appliqué. Prêt à tracker.*")
+    except: pass
+    asyncio.create_task(run_bot_logic())
+
+async def run_bot_logic():
+    async with aiohttp.ClientSession() as session:
+        await connect_pumpfun_websocket(session)
+
+@app.get("/")
+async def root():
+    return {"status": "online", "active_scans": len(alerted_tokens)}

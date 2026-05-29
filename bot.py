@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SOLANA PUMP.FUN SNIPER BOT — PURE VOLUME v6          ║
-║   Suppression totale du Top 10 — Alerte brute sur le MCAP    ║
+║         SOLANA PUMP.FUN SNIPER BOT — MULTI-FILTRES v7        ║
+║   Filtres stricts : Holders, Volume, MCAP et Liquidité       ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -19,11 +19,14 @@ from fastapi import FastAPI
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# ── FILTRE DE DÉCLENCHEMENT UNIQUE ──────────────────────────
-MIN_MARKET_CAP_USD    = 12000.0    # Alerte dès que le volume pousse le MCAP ici
+# ── CONFIGURATION DES 4 FILTRES MINIMUMS ────────────────────
+MIN_HOLDERS           = 50         # Minimum 50 Holders distincts
+MIN_MARKET_CAP_USD    = 5000.0     # Minimum $5,000 de Market Cap
+MIN_LIQUIDITY_USD     = 5000.0     # Minimum $5,000 de Liquidité API
+MIN_VOLUME_USD        = 5000.0     # Minimum $5,000 de Volume accumulé
 
 # ── TIMINGS DE SURVEILLANCE ─────────────────────────────────
-CHECK_INTERVAL_SEC    = 6          # Fréquence de rafraîchissement rapide (toutes les 6s)
+CHECK_INTERVAL_SEC    = 6          # Analyse rapide toutes les 6s
 MAX_MONITOR_MINUTES   = 5          # Temps max de suivi après la création (5 min)
 
 PUMPFUN_WS_PRIMARY    = "wss://pumpportal.fun/api/data"
@@ -55,9 +58,11 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
                 if not token_data:
                     return None
                     
+                # Extraction sécurisée des métriques brutes
                 return {
                     "mcap": float(token_data.get("marketCapUsd", 0) or 0),
                     "liquidity": float(token_data.get("liquidityUsd", 0) or 0),
+                    "volume": float(token_data.get("volume5mUsd", 0) or token_data.get("volumeUsd", 0) or 0),
                     "holders_count": int(token_data.get("holdersCount", 0) or 0)
                 }
     except Exception as e:
@@ -65,7 +70,7 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
     return None
 
 # ══════════════════════════════════════════════════════════════
-# MONITORING DIRECT SUR LE MARKET CAP
+# MONITORING AVEC CORRÉLATION DES 4 FILTRES SIMULTANÉS
 # ══════════════════════════════════════════════════════════════
 
 async def monitor_token(session: aiohttp.ClientSession, event: dict):
@@ -91,36 +96,46 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
 
         mcap = axiom_data["mcap"]
         liquidity = axiom_data["liquidity"]
+        volume = axiom_data["volume"]
+        holders = axiom_data["holders_count"]
 
-        log.info(f"⏱️ {symbol} ({elapsed}s) -> MCAP Axiom actuel: ${mcap:,.0f}")
+        # Log de debug interne pour suivre l'évolution des 4 metrics sur Railway
+        log.info(f"⏱️ {symbol} ({elapsed}s) -> MCAP: ${mcap:.0f} | Liq: ${liquidity:.0f} | Vol: ${volume:.0f} | Holders: {holders}")
 
-        # CONDITION UNIQUE : Validation par la capitalisation boursière
+        # VALIDATION STRICTE DES 4 CRITÈRES REQUIS
         if mcap < MIN_MARKET_CAP_USD:
             continue
+        if liquidity < MIN_LIQUIDITY_USD:
+            continue
+        if volume < MIN_VOLUME_USD:
+            continue
+        if holders < MIN_HOLDERS:
+            continue
 
-        # ENVOI IMMÉDIAT (Plus aucun blocage lié aux portefeuilles)
+        # TOUS LES FEUX SONT AU VERT -> DÉCLENCHEMENT DE L'ALERTE
         alerted_tokens[mint] = "ALERTED"
         
         clean_name = event.get('name', '?').replace('*', '').replace('_', '').replace('`', '')
         clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
 
-        msg = f"""🚀 *SIGNAL VOLUMES ACTIFS*
+        msg = f"""🎯 *PÉPITE CONFIGURÉE VALIDÉE*
 • *Jeton :* {clean_name} ({clean_symbol})
 • *Mint :* `{mint}`
 
 ━━━━━━━━━━━━━━━━━━━━━
 📊 *METRICS EN DIRECT D'AXIOM*
-├ 💰 Market Cap : *${mcap:,.0f}* (Objectif >$12K ✅)
-├ 💧 Liquide API : *${liquidity:,.0f}*
-├ 👥 Total Holders : *{axiom_data['holders_count']}*
-└ ⏱️ Temps de tracking : *{elapsed}s après création*
+├ 💰 Market Cap : *${mcap:,.0f}* (>$5K ✅)
+├ 💧 Liquidité : *${liquidity:,.0f}* (>$5K ✅)
+├ 💸 Volume : *${volume:,.0f}* (>$5K ✅)
+├ 👥 Holders : *{holders}* (>{MIN_HOLDERS} ✅)
+└ ⏱️ Temps de validation : *{elapsed}s après création*
 
 ━━━━━━━━━━━━━━━━━━━━━
 🔗 [Axiom Trade](https://axiom.trade/token/{mint}) | [Pump.fun](https://pump.fun/{mint})"""
 
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            log.info(f"🚀 [ALERTE SUCCESS] {symbol} envoyé avec un MCAP de ${mcap:,.0f} après {elapsed}s")
+            log.info(f"🚀 [ALERTE EMIS] {symbol} valide les 4 critères après {elapsed}s !")
         except Exception as e:
             log.error(f"Erreur d'envoi Telegram pour {symbol} : {e}")
         return
@@ -150,7 +165,7 @@ async def connect_pumpfun(session: aiohttp.ClientSession):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v6 : Mode Pure Volume Activé (Filtre Top 10 désactivé).*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v7 : Filtre combiné Activé (Min 50 Holders / $5K MCAP / $5K Liq / $5K Vol).*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

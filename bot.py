@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SOLANA PUMP.FUN SNIPER BOT — VERSION MCAP TARGET     ║
-║   Correction flux API Axiom — Zéro faux négatif sur la Liq   ║
+║         SOLANA PUMP.FUN SNIPER BOT — DYNAMIC FILTERS         ║
+║   Filtre Holders Évolutif : Spécial Bundlers (0-10 min)      ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -19,13 +19,16 @@ from fastapi import FastAPI
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# ── FILTRES SÉCURISÉS (CORRESPONDANCE ECRAN AXIOM) ──────────
-MAX_TOP10_HOLD_PCT    = 29.0       # Seuil cible pour le Top 10 Holders
-MIN_MARKET_CAP_USD    = 15000.0    # Sécurité : Un MCAP > $15K garantit les ~$10K de liq visuelle
+# ── FILTRES SÉCURISÉS & DYNAMIQUES ──────────────────────────
+MIN_MARKET_CAP_USD    = 15000.0    # Déclencheur de suivi (Seuil MCAP stable)
 
-# ── TIMINGS DE SURVEILLANCE CONTINUE ─────────────────────────
+# Configuration du Top 10 Holders évolutif
+MAX_TOP10_START_PCT   = 35.0       # Seuil toléré durant les 10 premières minutes (Spécial Bundlers)
+MAX_TOP10_LATE_PCT    = 29.0       # Seuil strict appliqué après les 10 premières minutes
+
+# ── TIMINGS DE SURVEILLANCE EXTENSION 10 MIN+ ────────────────
 CHECK_INTERVAL_SEC    = 8          # Fréquence de rafraîchissement (toutes les 8s)
-MAX_MONITOR_MINUTES   = 5          # Durée maximale de suivi pour chaque token (5 min)
+MAX_MONITOR_MINUTES   = 12         # Augmenté à 12 min pour analyser le comportement après les 10 min de vie
 
 PUMPFUN_WS_PRIMARY    = "wss://pumpportal.fun/api/data"
 AXIOM_TOKEN_API       = "https://api.axiom.trade/v1/token/{mint}"
@@ -67,7 +70,7 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
     return None
 
 # ══════════════════════════════════════════════════════════════
-# MONITORING PAR SEUILS DE CORRÉLATION MCAP / HOLDERS
+# MONITORING AVEC FILTRAGE DYNAMIQUE TEMPOREL
 # ══════════════════════════════════════════════════════════════
 
 async def monitor_token(session: aiohttp.ClientSession, event: dict):
@@ -95,19 +98,26 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
         top10_pct = axiom_data["top10_pct"]
         mcap = axiom_data["mcap"]
 
-        log.info(f"⏱️ {symbol} ({elapsed}s) -> MCAP Axiom: ${mcap:,.0f} | Top 10 Axiom: {top10_pct}%")
+        # Détermination dynamique du seuil selon l'âge du token
+        if elapsed <= 600:  # Moins ou égal à 10 minutes (600 secondes)
+            current_max_top10 = MAX_TOP10_START_PCT
+            period_label = "Phase Initiale (0-10m)"
+        else:
+            current_max_top10 = MAX_TOP10_LATE_PCT
+            period_label = "Phase Tardive (>10m)"
 
-        # CRITÈRE 1 : Utilisation du Market Cap comme déclencheur ultra-fiable
+        log.info(f"⏱️ {symbol} ({elapsed}s) -> MCAP: ${mcap:,.0f} | Top 10: {top10_pct}% | Limite temporaire: {current_max_top10}%")
+
+        # CRITÈRE 1 : Le Market Cap doit passer les $15,000
         if mcap < MIN_MARKET_CAP_USD:
             continue
 
-        # PROTECTION ANTI-BUG CACHE 100% (Attente de l'initialisation des nodes d'Axiom)
+        # PROTECTION ANTI-BUG CACHE 100% (Attente du chargement initial d'Axiom)
         if top10_pct >= 99.9 or top10_pct == 0.0:
-            log.info(f"⏳ {symbol} ({elapsed}s) -> MCAP OK (${mcap:,.0f}) mais calcul des holders en cours chez Axiom...")
             continue
 
-        # CRITÈRE 2 : Vérification de la dilution sous ton seuil cible
-        if top10_pct > MAX_TOP10_HOLD_PCT:
+        # CRITÈRE 2 : Application du filtre dynamique (35% si < 10min, sinon 29%)
+        if top10_pct > current_max_top10:
             continue
 
         # VALIDATION ET ENVOI DE L'ALERTE
@@ -116,7 +126,7 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
         clean_name = event.get('name', '?').replace('*', '').replace('_', '').replace('`', '')
         clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
 
-        msg = f"""🎯 *PÉPITE DÉTECTÉE (FILTRE MCAP)*
+        msg = f"""🎯 *PÉPITE ENTRÉE VALIDÉE*
 • *Jeton :* {clean_name} ({clean_symbol})
 • *Mint :* `{mint}`
 
@@ -124,10 +134,10 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
 📊 *METRICS EN DIRECT D'AXIOM*
 ├ 💰 Market Cap : *${mcap:,.0f}* (Filtre: >$15K ✅)
 ├ 💧 Liquide API : *${liquidity:,.0f}*
-└ ⏱️ Temps de tracking : *{elapsed}s après création*
+└ ⏱️ Âge au trigger : *{elapsed}s ({int(elapsed/60)}m {elapsed%60}s)*
 
-👥 *DISTRIBUTION TRADERS*
-├ 🎯 Top 10 Holders : *{top10_pct}%* (Seuil <29% ✅)
+👥 *DISTRIBUTION TRADERS ({period_label})*
+├ 🎯 Top 10 Holders : *{top10_pct}%* (Seuil maximum: {current_max_top10}% ✅)
 └ 👥 Total Holders : *{axiom_data['holders_count']}*
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -135,13 +145,13 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
 
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            log.info(f"🚀 [ALERTE SUCCÈS] Signal envoyé pour {symbol} au MCAP de ${mcap:,.0f} (Top 10: {top10_pct}%)")
+            log.info(f"🚀 [ALERTE] Signal envoyé pour {symbol} ({period_label}) à {top10_pct}% (MCAP: ${mcap:,.0f})")
         except Exception as e:
             log.error(f"Erreur d'envoi Telegram pour {symbol} : {e}")
         return
 
     if alerted_tokens.get(mint) != "ALERTED":
-        log.info(f"🛑 Fin de suivi (Expiré 5m) pour {symbol}.")
+        log.info(f"🛑 Fin de suivi (Expiré {MAX_MONITOR_MINUTES}m) pour {symbol}.")
 
 # ══════════════════════════════════════════════════════════════
 # CONNEXION FLUX DE CRÉATION
@@ -165,7 +175,7 @@ async def connect_pumpfun(session: aiohttp.ClientSession):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v3 : Tracking par Market Cap activé (Zéro filtre bloquant).*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v4 : Filtre intelligent Bundlers (35% < 10 min / 29% > 10 min) activé.*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

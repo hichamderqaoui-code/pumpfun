@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SOLANA PUMP.FUN SNIPER BOT — MULTI-FILTRES v7        ║
-║   Filtres stricts : Holders, Volume, MCAP et Liquidité       ║
+║         SOLANA PUMP.FUN SNIPER BOT — MULTI-FILTRES v7.1      ║
+║   Filtres stricts + Logs de force pour débug d'API Axiom     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -32,6 +32,7 @@ MAX_MONITOR_MINUTES   = 5          # Temps max de suivi après la création (5 m
 PUMPFUN_WS_PRIMARY    = "wss://pumpportal.fun/api/data"
 AXIOM_TOKEN_API       = "https://api.axiom.trade/v1/token/{mint}"
 
+# Force le niveau INFO pour être sûr de tout voir sur Railway
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json"
         }
-        async with session.get(url, headers=headers, timeout=4) as r:
+        # Augmentation du timeout à 6s au cas où l'API sature
+        async with session.get(url, headers=headers, timeout=6) as r:
             if r.status == 200:
                 data = await r.json()
                 token_data = data.get("data", {})
@@ -58,7 +60,6 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
                 if not token_data:
                     return None
                     
-                # Extraction sécurisée des métriques brutes
                 return {
                     "mcap": float(token_data.get("marketCapUsd", 0) or 0),
                     "liquidity": float(token_data.get("liquidityUsd", 0) or 0),
@@ -66,11 +67,11 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
                     "holders_count": int(token_data.get("holdersCount", 0) or 0)
                 }
     except Exception as e:
-        log.debug(f"Erreur d'indexation Axiom pour {mint[:8]} : {e}")
+        log.info(f"⚠️ [API Axiom] Erreur ou Timeout pour {mint[:8]} : {e}")
     return None
 
 # ══════════════════════════════════════════════════════════════
-# MONITORING AVEC CORRÉLATION DES 4 FILTRES SIMULTANÉS
+# MONITORING AVEC LOG DE FORCE DANS LA CONSOLE
 # ══════════════════════════════════════════════════════════════
 
 async def monitor_token(session: aiohttp.ClientSession, event: dict):
@@ -91,7 +92,9 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
         axiom_data = await fetch_axiom_pro_metrics(session, mint)
         elapsed = int(time.time() - alerted_tokens[mint]["start_time"])
 
+        # LOG DE FORCE : Si l'API renvoie None, on veut le voir dans Railway !
         if not axiom_data:
+            log.info(f"⏳ {symbol} ({elapsed}s) -> En attente d'indexation chez Axiom...")
             continue
 
         mcap = axiom_data["mcap"]
@@ -99,8 +102,8 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
         volume = axiom_data["volume"]
         holders = axiom_data["holders_count"]
 
-        # Log de debug interne pour suivre l'évolution des 4 metrics sur Railway
-        log.info(f"⏱️ {symbol} ({elapsed}s) -> MCAP: ${mcap:.0f} | Liq: ${liquidity:.0f} | Vol: ${volume:.0f} | Holders: {holders}")
+        # Log d'état complet
+        log.info(f"📊 {symbol} ({elapsed}s) -> MCAP: ${mcap:.0f} | Liq: ${liquidity:.0f} | Vol: ${volume:.0f} | Holders: {holders}")
 
         # VALIDATION STRICTE DES 4 CRITÈRES REQUIS
         if mcap < MIN_MARKET_CAP_USD:
@@ -112,13 +115,13 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
         if holders < MIN_HOLDERS:
             continue
 
-        # TOUS LES FEUX SONT AU VERT -> DÉCLENCHEMENT DE L'ALERTE
+        # TOUS LES FEUX SONT AU VERT
         alerted_tokens[mint] = "ALERTED"
         
         clean_name = event.get('name', '?').replace('*', '').replace('_', '').replace('`', '')
         clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
 
-        msg = f"""🎯 *PÉPITE CONFIGURÉE VALIDÉE*
+        msg = f"""🎯 *PÉPITE REÇUE — CRITÈRES OK*
 • *Jeton :* {clean_name} ({clean_symbol})
 • *Mint :* `{mint}`
 
@@ -135,13 +138,13 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
 
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            log.info(f"🚀 [ALERTE EMIS] {symbol} valide les 4 critères après {elapsed}s !")
+            log.info(f"🚀 [ALERTE] Signal envoyé pour {symbol} !")
         except Exception as e:
             log.error(f"Erreur d'envoi Telegram pour {symbol} : {e}")
         return
 
     if alerted_tokens.get(mint) != "ALERTED":
-        log.debug(f"🛑 Fin de suivi (Expiré) pour {symbol}.")
+        log.info(f"🛑 Fin de suivi (Expiré) pour {symbol}.")
 
 # ══════════════════════════════════════════════════════════════
 # CONNEXION FLUX DE CRÉATION
@@ -165,7 +168,7 @@ async def connect_pumpfun(session: aiohttp.ClientSession):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v7 : Filtre combiné Activé (Min 50 Holders / $5K MCAP / $5K Liq / $5K Vol).*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v7.1 : Mode Débug Logs Axiom activé.*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

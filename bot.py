@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SOLANA PUMP.FUN SNIPER BOT — VERSION DILUTION        ║
+║         SOLANA PUMP.FUN SNIPER BOT — VERSION DILUTION v2     ║
 ║   Suivi continu Axiom Pro — Idéal pour chasser les x50/x100  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -20,8 +20,8 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # ── FILTRES CONFIGURABLES ───────────────────────────────────
-MAX_TOP10_HOLD_PCT    = 29         # Seuil cible pour le Top 10 Holders
-MIN_LIQUIDITY_USD     = 10000      # Objectif de liquidité minimum ($10,000)
+MAX_TOP10_HOLD_PCT    = 29.0       # Seuil cible pour le Top 10 Holders
+MIN_LIQUIDITY_USD     = 10000.0    # Objectif de liquidité minimum ($10,000)
 
 # ── TIMINGS DE SURVEILLANCE CONTINUE ─────────────────────────
 CHECK_INTERVAL_SEC    = 8          # Fréquence de rafraîchissement (toutes les 8s)
@@ -54,6 +54,9 @@ async def fetch_axiom_pro_metrics(session: aiohttp.ClientSession, mint: str) -> 
                 data = await r.json()
                 token_data = data.get("data", {})
                 
+                if not token_data:
+                    return None
+                    
                 return {
                     "mcap": float(token_data.get("marketCapUsd", 0) or 0),
                     "liquidity": float(token_data.get("liquidityUsd", 0) or 0),
@@ -88,31 +91,40 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
         axiom_data = await fetch_axiom_pro_metrics(session, mint)
         elapsed = int(time.time() - alerted_tokens[mint]["start_time"])
 
-        # Si Axiom n'a pas encore indexé les premières secondes, on attend la boucle suivante
+        # Si Axiom n'a pas encore créé la fiche du token, on patiente
         if not axiom_data:
+            log.info(f"⏱️ {symbol} ({elapsed}s) -> Axiom : Fiche non initialisée.")
             continue
 
         liquidity = axiom_data["liquidity"]
         top10_pct = axiom_data["top10_pct"]
         mcap = axiom_data["mcap"]
 
-        log.info(f"⏱️ {symbol} ({elapsed}s) -> Liq: ${liquidity:,.0f} | Top 10 actuel: {top10_pct}%")
+        log.info(f"⏱️ {symbol} ({elapsed}s) -> Liq: ${liquidity:,.0f} | Top 10 Axiom: {top10_pct}%")
 
         # CRITÈRE 1 : On attend impérativement que la liquidité passe les $10,000
         if liquidity < MIN_LIQUIDITY_USD:
             continue
 
-        # CRITÈRE 2 : On vérifie si la distribution s'est affinée
-        # S'il y a trop de concentration, on ne coupe plus le script (pas de break).
-        # On laisse le token respirer, le volume peut le diluer aux prochaines secondes !
+        # GESTION DU FAUX POSITIF 100% : Si Axiom renvoie pile 100% ou 0%, les données de holders 
+        # ne sont pas encore prêtes sur leur serveur. On attend la vraie valeur.
+        if top10_pct >= 99.9 or top10_pct == 0.0:
+            log.info(f"⏳ {symbol} ({elapsed}s) -> Liquide (${liquidity:,.0f}) mais calcul des holders en cours chez Axiom...")
+            continue
+
+        # CRITÈRE 2 : On vérifie si la distribution s'est affinée sous notre seuil
         if top10_pct > MAX_TOP10_HOLD_PCT:
             continue
 
         # LES DEUX FEUX SONT AU VERT -> DÉCLENCHEMENT DE L'ALERTE
         alerted_tokens[mint] = "ALERTED"
         
+        # Nettoyage des caractères spéciaux pour le Markdown Telegram
+        clean_name = event.get('name', '?').replace('*', '').replace('_', '').replace('`', '')
+        clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
+
         msg = f"""🎯 *PÉPITE DILUÉE & VALIDÉE*
-• *Jeton :* {event.get('name', '?')} ({symbol})
+• *Jeton :* {clean_name} ({clean_symbol})
 • *Mint :* `{mint}`
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -130,9 +142,9 @@ async def monitor_token(session: aiohttp.ClientSession, event: dict):
 
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            log.info(f"🚀 [ALERTE] Signal envoyé pour {symbol} après {elapsed}s de suivi (Top 10: {top10_pct}%)")
+            log.info(f"🚀 [ALERTE SUCCÈS] Signal envoyé pour {symbol} après {elapsed}s de suivi (Top 10: {top10_pct}%)")
         except Exception as e:
-            log.error(f"Erreur d'envoi Telegram : {e}")
+            log.error(f"Erreur d'envoi Telegram pour {symbol} : {e}")
         return
 
     # Si on sort de la boucle sans alerte, le token n'a pas rempli les critères en 5 min
@@ -153,7 +165,6 @@ async def connect_pumpfun(session: aiohttp.ClientSession):
                     try:
                         data = json.loads(raw_msg)
                         if isinstance(data, dict) and data.get("txType") == "create":
-                            # Assigne chaque token à un worker indépendant en tâche de fond
                             asyncio.create_task(monitor_token(session, data))
                     except: pass
         except:
@@ -162,7 +173,7 @@ async def connect_pumpfun(session: aiohttp.ClientSession):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour : Mode Tracking Continu avec Tolérance de Dilution activé.*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v2 : Mode Anti-Bug 100% Axiom activé.*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

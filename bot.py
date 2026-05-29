@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        SOLANA PUMP.FUN SNIPER BOT — AXIOM PRO LINK v12.2     ║
-║    Correction Syntaxe F-String Liens — Production Stable     ║
+║        SOLANA PUMP.FUN SNIPER BOT — REAL TIME MCAP v12.3     ║
+║    Correctif Prix Figé — API Ultra-Rapide Pump Portal        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -23,7 +23,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 TARGET_MARKET_CAP_USD = 10000.0    # Objectif strict : $10,000 USD
 MAX_MONITOR_MINUTES = 10           # Temps max de suivi : 10 minutes
-CHECK_INTERVAL_SEC = 6             # Interrogation toutes les 6 secondes
+CHECK_INTERVAL_SEC = 5             # Interrogation toutes les 5 secondes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -33,24 +33,38 @@ app = FastAPI()
 alerted_tokens = {}
 
 # ══════════════════════════════════════════════════════════════
-# REQUÊTE DE PRIX RÉEL VIA DEXSCREENER API
+# REQUÊTE DE PRIX EN TEMPS RÉEL (PUMP PORTAL API)
 # ══════════════════════════════════════════════════════════════
 
 async def get_real_market_cap(session: aiohttp.ClientSession, mint: str) -> float:
+    """Interroge directement l'API Pump Portal pour éviter le délai d'indexation DexScreener"""
     try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        url = f"https://pumpportal.fun/api/data/token-info?mint={mint}"
         async with session.get(url, timeout=3) as r:
+            if r.status == 200:
+                data = await r.json()
+                # On récupère la valeur en USD du Market Cap calculée directement par la plateforme
+                mcap = data.get("marketCap")
+                if mcap:
+                    return float(mcap)
+    except Exception as e:
+        log.debug(f"Erreur PumpPortal API pour {mint[:8]} : {e}")
+    
+    # Backup sur DexScreener si Pump Portal ne répond pas
+    try:
+        url_dex = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        async with session.get(url_dex, timeout=2) as r:
             if r.status == 200:
                 data = await r.json()
                 pairs = data.get("pairs")
                 if pairs and len(pairs) > 0:
                     return float(pairs[0].get("marketCap", 0))
-    except Exception as e:
-        log.debug(f"Erreur lecture prix pour {mint[:8]} : {e}")
+    except: pass
+    
     return 0.0
 
 # ══════════════════════════════════════════════════════════════
-# ENVOI DE L'ALERTE TELEGRAM AVEC LIEN AXIOM PRO
+# ENVOI DE L'ALERTE TELEGRAM
 # ══════════════════════════════════════════════════════════════
 
 async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, elapsed_seconds: int):
@@ -60,7 +74,6 @@ async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, el
     minutes = int(elapsed_seconds // 60)
     seconds = int(elapsed_seconds % 60)
 
-    # Liens propres générés en amont pour éviter les conflits d'accolades dans le bloc texte
     link_axiom = f"https://axiom.trade/token/{mint}"
     link_dex = f"https://dexscreener.com/solana/{mint}"
     link_pump = f"https://pump.fun/{mint}"
@@ -70,7 +83,7 @@ async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, el
         f"• *Jeton :* {clean_name} ({clean_symbol})\n"
         f"• *Mint :* `{mint}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 *DONNÉES RÉELLES DE LA CHAÎNE*\n"
+        "📊 *DONNÉES EN DIRECT DE LA BLOCKCHAIN*\n"
         f"├ 💰 Vrai Market Cap : *${mcap:,.0f}* ✅\n"
         "├ ⏱️ Statut : *Filtre <10 min Validé*\n"
         f"└ ⏱️ Temps écoulé : *{minutes}m {seconds}s*\n\n"
@@ -80,12 +93,12 @@ async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, el
     
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-        log.info(f"🔥 [ALERTE RÉELLE] Signal envoyé pour {clean_symbol} (${mcap:,.0f})")
+        log.info(f"🔥 [ALERTE ENVOYÉE] {clean_symbol} a franchi les 10K ! (${mcap:,.0f})")
     except Exception as e:
         log.error(f"Erreur d'envoi Telegram : {e}")
 
 # ══════════════════════════════════════════════════════════════
-# MONITORING FILTRÉ DE O À 10 MINUTES
+# MONITORING DE LA FENÊTRE DE 10 MINUTES
 # ══════════════════════════════════════════════════════════════
 
 async def monitor_token(session: aiohttp.ClientSession, mint: str, symbol: str, name: str):
@@ -95,7 +108,7 @@ async def monitor_token(session: aiohttp.ClientSession, mint: str, symbol: str, 
     alerted_tokens[mint] = {"status": "monitoring", "start_time": time.time()}
     max_loops = int((MAX_MONITOR_MINUTES * 60) // CHECK_INTERVAL_SEC)
     
-    log.info(f"👀 [Tracking Réel] Début des 10 min de surveillance pour {symbol}")
+    log.info(f"👀 [Tracking Réel] Début de la surveillance pour {symbol}")
 
     for _ in range(max_loops):
         await asyncio.sleep(CHECK_INTERVAL_SEC)
@@ -109,17 +122,18 @@ async def monitor_token(session: aiohttp.ClientSession, mint: str, symbol: str, 
         if real_mcap <= 0:
             continue
 
-        log.info(f"⏱️ {symbol} ({elapsed}s / 600s) -> Vrai MCAP : ${real_mcap:,.0f}")
+        log.info(f"⏱️ {symbol} ({elapsed}s / 600s) -> MCAP Réel : ${real_mcap:,.0f}")
 
+        # Validation stricte du franchissement des 10K USD
         if real_mcap < TARGET_MARKET_CAP_USD:
             continue
 
         alerted_tokens[mint] = "ALERTED"
-        await send_telegram_alert(session, mint, symbol, name, real_mcap, elapsed)
+        await send_telegram_alert(mint, symbol, name, real_mcap, elapsed)
         return
 
 # ══════════════════════════════════════════════════════════════
-# CONNEXION FLUX WEBSOCKET PUMP.FUN
+# GESTION FASTAPI & ECOUTE
 # ══════════════════════════════════════════════════════════════
 
 async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
@@ -141,14 +155,10 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
             log.error(f"Erreur Flux WebSocket : {e}")
             await asyncio.sleep(3)
 
-# ══════════════════════════════════════════════════════════════
-# ENTRÉE FASTAPI
-# ══════════════════════════════════════════════════════════════
-
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v12.2 : Correctif des liens appliqué. Prêt à tracker.*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚡ *Mise à jour v12.3 : Correction du flux prix (PumpPortal Live Tracker API) opérationnelle.*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

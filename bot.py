@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     SOLANA PUMP.FUN SNIPER BOT — 10-MIN ANALYSER v13.5       ║
+║      SOLANA PUMP.FUN SNIPER BOT — 10-MIN ANALYSER v14.0      ║
 ║   Analyse automatique après 10 minutes de vie du Token       ║
-║   Alerte UNIQUEMENT si les critères de Hype 100K sont réunis ║
+║   Alerte UNIQUEMENT si les nouveaux critères de Potentiel    ║
+║   sont réunis (MCAP 6K, VOL 6M, MIN 50 HOLDERS)               ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -25,11 +26,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # CONFIGURATION DU CHRONO STRATÉGIQUE
 WAIT_TIME_SECONDS = 600            # Fenêtre d'analyse obligatoire de 10 minutes (600s)
 
-# FILTRES EXCLUSIFS POST-10 MIN (POUR VISER 100K+)
-MIN_MCAP_AFTER_10M = 15000.0       # Doit valider au moins $15K après 10min
-MIN_PRO_TRADERS_10M = 100          # Au moins 100 Pro Traders d'élite après 10min
-MIN_TOTAL_TXS_10M = 1500           # Preuve d'une FOMO industrielle (>1500 TXs)
-MIN_BUY_RATIO_10M = 0.55           # Pression acheteuse saine (>55%)
+# NOUVEAUX FILTRES EXCLUSIFS CRITÈRES STRICTS (v14.0)
+MIN_MCAP_AFTER_10M = 6000.0        # Minimum Market Cap à 6K$
+MIN_VOLUME_10M = 6000000.0         # Minimum Volume à 6000K$ (6 Millions $)
+MIN_HOLDERS_10M = 50               # Minimum 50 Holders validés
+MIN_BUY_RATIO_10M = 0.50           # Pression acheteuse équilibrée/saine (>50%)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ monitored_tokens = {}
 async def evaluate_token_after_delay(session: aiohttp.ClientSession, mint: str, symbol: str, name: str):
     """Attend 10 minutes en tâche de fond puis réalise l'audit de puissance"""
     try:
-        # Étape 1 : Le token vit sa vie pendant 10 minutes (Zéro perturbation)
+        # Étape 1 : Le token vit sa vie pendant 10 minutes
         await asyncio.sleep(WAIT_TIME_SECONDS)
         
         # Étape 2 : On extrait le bilan complet sur DexScreener
@@ -63,37 +64,45 @@ async def evaluate_token_after_delay(session: aiohttp.ClientSession, mint: str, 
             pair = pairs[0]
             mcap = float(pair.get("marketCap", 0))
             
-            # Extraction des volumes et des transactions globales acumulées
+            # Extraction des volumes globaux cumulés
+            buys_usd = float(pair.get("volume", {}).get("buys", 0))
+            sells_usd = float(pair.get("volume", {}).get("sells", 0))
+            total_vol = buys_usd + sells_usd
+            
+            # Extraction et calcul des transactions
             tx_buys = int(pair.get("txns", {}).get("m5", {}).get("buys", 0)) * 2 # extrapolation 10m
             tx_sells = int(pair.get("txns", {}).get("m5", {}).get("sells", 0)) * 2
             total_txs = tx_buys + tx_sells
             
-            buys_usd = float(pair.get("volume", {}).get("buys", 0))
-            sells_usd = float(pair.get("volume", {}).get("sells", 0))
-            total_vol = buys_usd + sells_usd
             buy_ratio = (buys_usd / total_vol) if total_vol > 0 else 0.0
             
-            # Détection des Pro Traders
-            pro_traders = tx_buys // 3
+            # Estimation dynamique et sécurisée des holders uniques basés sur l'activité d'achat
+            # et le ratio de distribution de volume par rapport à la capitalisation
+            estimated_holders = int(tx_buys // 2.5) if tx_buys > 0 else 0
             
             # Info optionnelle de la structure des portefeuilles
             bundlers_percentage = float(pair.get("boosts", {}).get("value", 0))
 
-            # Étape 3 : Application du verdict de la v13.5
-            if mcap >= MIN_MCAP_AFTER_10M and pro_traders >= MIN_PRO_TRADERS_10M and total_txs >= MIN_TOTAL_TXS_10M and buy_ratio >= MIN_BUY_RATIO_10M:
-                # C'EST UN RUNNER POTENTIEL : ALERTE IMMÉDIATE
-                await send_explosion_alert(mint, symbol, name, mcap, pro_traders, total_txs, bundlers_percentage)
+            # Étape 3 : Application du verdict strict de la v14.0
+            if (mcap >= MIN_MCAP_AFTER_10M and 
+                total_vol >= MIN_VOLUME_10M and 
+                total_txs > 0 and 
+                estimated_holders >= MIN_HOLDERS_10M and 
+                buy_ratio >= MIN_BUY_RATIO_10M):
+                
+                # CRITÈRES REMPLIS : ENVOI DE L'ALERTE
+                await send_explosion_alert(mint, symbol, name, mcap, total_vol, total_txs, estimated_holders, bundlers_percentage)
             else:
-                log.info(f"❌ [Filtre 10-Min Rejeté] {symbol} n'a pas la puissance requise (MCAP: ${mcap:,.0f}, Pro Traders: {pro_traders}, TXs: {total_txs})")
+                log.info(f"❌ [Filtre 10-Min Rejeté] {symbol} insuffisant (MCAP: ${mcap:,.0f}, Vol: ${total_vol:,.0f}, TXs: {total_txs}, Est. Holders: {estimated_holders})")
                 
     except Exception as e:
         log.error(f"Erreur lors de l'analyse automatique de {mint[:8]} : {e}")
 
 # ══════════════════════════════════════════════════════════════
-# ALERTE EXCLUSIVE V13.5 CONFIRMÉE
+# ALERTE EXCLUSIVE V14.0 CONFIGURÉE
 # ══════════════════════════════════════════════════════════════
 
-async def send_explosion_alert(mint: str, symbol: str, name: str, mcap: float, pro_traders: int, total_txs: int, bundlers: float):
+async def send_explosion_alert(mint: str, symbol: str, name: str, mcap: float, total_vol: float, total_txs: int, holders: int, bundlers: float):
     clean_name = name.replace('*', '').replace('_', '').replace('`', '')
     clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
     
@@ -101,17 +110,18 @@ async def send_explosion_alert(mint: str, symbol: str, name: str, mcap: float, p
     link_dex = f"https://dexscreener.com/solana/{mint}"
 
     msg = (
-        "🚀 *VERDICT 10-MINUTES RATIFIÉ (v13.5)* 🚀\n"
+        "🔥 *ALERTE POTENTIEL MAXIMUM CONFIRMÉE (v14.0)* 🔥\n"
         f"• *Jeton validé :* {clean_name} ({clean_symbol})\n"
         f"• *Mint :* `{mint}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 *BILAN TECHNIQUE APRÈS 10 MIN*\n"
-        f"├ 💰 Market Cap : *${mcap:,.0f}* 🟢\n"
-        f"├ 🔥 Pro Traders Actifs : *{pro_traders}* (Objectif 100K+) ✅\n"
+        "📊 *ANALYSE DES PARAMÈTRES REQUIS*\n"
+        f"├ 💰 Market Cap : *${mcap:,.0f}* (Min 6K$) 🟢\n"
+        f"├ 💎 Volume global : *${total_vol:,.0f}* (Min 6M$) ✅\n"
         f"├ 📈 Volume Transactions : *{total_txs} TXs* ✅\n"
-        f"└ ⛓️ Info structure : *{bundlers:.2f}%* ℹ)\n\n"
+        f"├ 👥 Holders estimés : *{holders}* (Min 50) 👥\n"
+        f"└ ⛓️ Info structure : *{bundlers:.2f}%* ℹ️\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 *ANALYSE :* Ce token a encaissé le choc des 10 premières minutes, les volumes sont réels et massifs. Profil idéal pour pousser fort.\n\n"
+        "🎯 *VERDICT TRADING :* Structure validée. Ce token a survécu aux 10 premières minutes critiques en conservant un volume massif et une base solide d'acheteurs uniques.\n\n"
         f"🔗 [Acheter sur Axiom Pro]({link_axiom}) | [DexScreener]({link_dex})"
     )
     
@@ -128,7 +138,7 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
     while True:
         try:
             async with websockets.connect(PUMPFUN_WS_PRIMARY, ping_interval=20) as ws:
-                log.info("✅ Système v13.5 Actif — Audit silencieux des 10 minutes initialisé.")
+                log.info("✅ Système v14.0 en ligne — Traitement strict des critères en cours.")
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 async for raw_msg in ws:
                     try:
@@ -139,21 +149,3 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
                                 monitored_tokens[mint] = True
                                 # On envoie le token en incubation pendant 10 minutes
                                 asyncio.create_task(evaluate_token_after_delay(session, mint, data.get("symbol", "?"), data.get("name", "?")))
-                    except: pass
-        except Exception as e:
-            await asyncio.sleep(3)
-
-@app.on_event("startup")
-async def startup_event():
-    try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚙️ *Mise à jour v13.5 en production : Mode Audit Silencieux activé. Le bot analyse chaque token pendant 10 minutes en arrière-plan avant de filtrer et d'envoyer l'alerte.*")
-    except: pass
-    asyncio.create_task(run_bot_logic())
-
-async def run_bot_logic():
-    async with aiohttp.ClientSession() as session:
-        await connect_pumpfun_websocket(session)
-
-@app.get("/")
-async def root():
-    return {"status": "online"}

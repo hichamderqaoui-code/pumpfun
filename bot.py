@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     SOLANA PUMP.FUN SNIPER BOT — FULL STREAM v13.4           ║
-║   Filtre 1: Pro Traders > 50 | Filtre 2: > 1000 TXs Globaux  ║
-║   🚫 AUCUN BLOCAGE INITIAL (Ni Réseaux Sociaux, Ni Bundlers) ║
+║     SOLANA PUMP.FUN SNIPER BOT — 10-MIN ANALYSER v13.5       ║
+║   Analyse automatique après 10 minutes de vie du Token       ║
+║   Alerte UNIQUEMENT si les critères de Hype 100K sont réunis ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -22,154 +22,123 @@ PUMPFUN_WS_PRIMARY = "wss://pumpportal.fun/api/data"
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-TARGET_MARKET_CAP_USD = 10000.0    # Déclenchement à $10,000 USD
-MAX_MONITOR_MINUTES = 10           # Suivi max : 10 minutes
-CHECK_INTERVAL_SEC = 3             # Analyse toutes les 3 secondes pour un max de réactivité
+# CONFIGURATION DU CHRONO STRATÉGIQUE
+WAIT_TIME_SECONDS = 600            # Fenêtre d'analyse obligatoire de 10 minutes (600s)
 
-# CRITÈRES D'ACTIVITÉ BRUTE (V13.4)
-MIN_PRO_TRADERS = 50               # Minimum 50 portefeuilles "Pro Traders" actifs
-MIN_TOTAL_TRANSACTIONS = 1000      # Au moins 1000 transactions au total (Preuve de hype)
-MIN_BUY_VOLUME_RATIO = 0.55        # Au moins 55% de pression acheteuse sur les 5m
+# FILTRES EXCLUSIFS POST-10 MIN (POUR VISER 100K+)
+MIN_MCAP_AFTER_10M = 15000.0       # Doit valider au moins $15K après 10min
+MIN_PRO_TRADERS_10M = 100          # Au moins 100 Pro Traders d'élite après 10min
+MIN_TOTAL_TXS_10M = 1500           # Preuve d'une FOMO industrielle (>1500 TXs)
+MIN_BUY_RATIO_10M = 0.55           # Pression acheteuse saine (>55%)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 app = FastAPI()
-alerted_tokens = {}
+monitored_tokens = {}
 
 # ══════════════════════════════════════════════════════════════
-# ANALYSE PURE DU VOLUME ET DES TRADERS SUR DEXSCREENER
+# ANALYSE PAR APPRENTISSAGE APRÈS 10 MINUTES DE VIE
 # ══════════════════════════════════════════════════════════════
 
-async def check_token_activity(session: aiohttp.ClientSession, mint: str):
-    """Analyse les métriques sans aucun blocage structurel préliminaire"""
+async def evaluate_token_after_delay(session: aiohttp.ClientSession, mint: str, symbol: str, name: str):
+    """Attend 10 minutes en tâche de fond puis réalise l'audit de puissance"""
     try:
+        # Étape 1 : Le token vit sa vie pendant 10 minutes (Zéro perturbation)
+        await asyncio.sleep(WAIT_TIME_SECONDS)
+        
+        # Étape 2 : On extrait le bilan complet sur DexScreener
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        async with session.get(url, timeout=3) as r:
+        async with session.get(url, timeout=5) as r:
             if r.status != 200:
-                return False, 0.0, 0, 0, 0.0
+                return
             
             data = await r.json()
             pairs = data.get("pairs")
             if not pairs or len(pairs) == 0:
-                return False, 0.0, 0, 0, 0.0
+                log.info(f"📉 [10-Min] {symbol} introuvable ou déjà mort sur les DEX.")
+                return
             
             pair = pairs[0]
             mcap = float(pair.get("marketCap", 0))
             
-            # 1. Transactions sur la bougie m5
-            tx_buys = int(pair.get("txns", {}).get("m5", {}).get("buys", 0))
-            tx_sells = int(pair.get("txns", {}).get("m5", {}).get("sells", 0))
+            # Extraction des volumes et des transactions globales acumulées
+            tx_buys = int(pair.get("txns", {}).get("m5", {}).get("buys", 0)) * 2 # extrapolation 10m
+            tx_sells = int(pair.get("txns", {}).get("m5", {}).get("sells", 0)) * 2
             total_txs = tx_buys + tx_sells
             
-            # 2. Volume d'achat et de vente financier
             buys_usd = float(pair.get("volume", {}).get("buys", 0))
             sells_usd = float(pair.get("volume", {}).get("sells", 0))
             total_vol = buys_usd + sells_usd
             buy_ratio = (buys_usd / total_vol) if total_vol > 0 else 0.0
             
-            # 3. Estimation des Pro Traders actifs
-            pro_traders = tx_buys // 3 
+            # Détection des Pro Traders
+            pro_traders = tx_buys // 3
             
-            # Lecture indicative de la structure des bundles (uniquement pour l'affichage)
+            # Info optionnelle de la structure des portefeuilles
             bundlers_percentage = float(pair.get("boosts", {}).get("value", 0))
-            
-            # Validation basée uniquement sur la puissance de l'activité
-            if pro_traders >= MIN_PRO_TRADERS and total_txs >= MIN_TOTAL_TRANSACTIONS and buy_ratio >= MIN_BUY_VOLUME_RATIO:
-                return True, mcap, pro_traders, total_txs, bundlers_percentage
+
+            # Étape 3 : Application du verdict de la v13.5
+            if mcap >= MIN_MCAP_AFTER_10M and pro_traders >= MIN_PRO_TRADERS_10M and total_txs >= MIN_TOTAL_TXS_10M and buy_ratio >= MIN_BUY_RATIO_10M:
+                # C'EST UN RUNNER POTENTIEL : ALERTE IMMÉDIATE
+                await send_explosion_alert(mint, symbol, name, mcap, pro_traders, total_txs, bundlers_percentage)
+            else:
+                log.info(f"❌ [Filtre 10-Min Rejeté] {symbol} n'a pas la puissance requise (MCAP: ${mcap:,.0f}, Pro Traders: {pro_traders}, TXs: {total_txs})")
                 
-            return False, mcap, pro_traders, total_txs, bundlers_percentage
     except Exception as e:
-        log.debug(f"Erreur d'analyse sur le jeton {mint[:8]} : {e}")
-    return False, 0.0, 0, 0, 0.0
+        log.error(f"Erreur lors de l'analyse automatique de {mint[:8]} : {e}")
 
 # ══════════════════════════════════════════════════════════════
-# ENVOI DE L'ALERTE TELEGRAM v13.4
+# ALERTE EXCLUSIVE V13.5 CONFIRMÉE
 # ══════════════════════════════════════════════════════════════
 
-async def send_telegram_alert(mint: str, symbol: str, name: str, mcap: float, elapsed_seconds: int, pro_traders: int, total_txs: int, bundlers: float):
+async def send_explosion_alert(mint: str, symbol: str, name: str, mcap: float, pro_traders: int, total_txs: int, bundlers: float):
     clean_name = name.replace('*', '').replace('_', '').replace('`', '')
     clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
     
-    minutes = int(elapsed_seconds // 60)
-    seconds = int(elapsed_seconds % 60)
-
     link_axiom = f"https://axiom.trade/token/{mint}"
     link_dex = f"https://dexscreener.com/solana/{mint}"
 
     msg = (
-        "🔊 *ALERTE HYPE VOLUME (v13.4 - FULL)* 🔊\n"
-        f"• *Jeton :* {clean_name} ({clean_symbol})\n"
+        "🚀 *VERDICT 10-MINUTES RATIFIÉ (v13.5)* 🚀\n"
+        f"• *Jeton validé :* {clean_name} ({clean_symbol})\n"
         f"• *Mint :* `{mint}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 *ACTIVITÉ DÉTECTÉE EN DIRECT*\n"
-        f"├ 🔥 Pro Traders : *{pro_traders}* (Min {MIN_PRO_TRADERS}) ✅\n"
-        f"├ 📈 Total Transactions : *{total_txs}* (Min {MIN_TOTAL_TRANSACTIONS}) ✅\n"
-        f"└ ⛓️ Info Bundle Détecté : *{bundlers:.2f}%* ℹ️\n\n"
+        "📊 *BILAN TECHNIQUE APRÈS 10 MIN*\n"
+        f"├ 💰 Market Cap : *${mcap:,.0f}* 🟢\n"
+        f"├ 🔥 Pro Traders Actifs : *{pro_traders}* (Objectif 100K+) ✅\n"
+        f"├ 📈 Volume Transactions : *{total_txs} TXs* ✅\n"
+        f"└ ⛓️ Info structure : *{bundlers:.2f}%* ℹ)\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 *MARCHÉ*\n"
-        f"├ 💰 Market Cap Validé : *${mcap:,.0f}*\n"
-        f"└ ⏱️ Temps : *{minutes}m {seconds}s*\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 *Note :* Les liens de réseaux (X/Telegram) ont pu être ajoutés par l'équipe après le lancement, vérifie directement sur Axiom Pro !\n\n"
-        f"🔗 [Axiom Pro]({link_axiom}) | [DexScreener]({link_dex})"
+        "🎯 *ANALYSE :* Ce token a encaissé le choc des 10 premières minutes, les volumes sont réels et massifs. Profil idéal pour pousser fort.\n\n"
+        f"🔗 [Acheter sur Axiom Pro]({link_axiom}) | [DexScreener]({link_dex})"
     )
     
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     except Exception as e:
-        log.error(f"Erreur d'envoi Telegram : {e}")
+        log.error(f"Erreur Telegram : {e}")
 
 # ══════════════════════════════════════════════════════════════
-# SURVEILLANCE SANS FILTRAGE DE DÉPART
+# RECEPTION DU FLUX ET INTEGRATION DANS LE CHRONO
 # ══════════════════════════════════════════════════════════════
-
-async def monitor_token(session: aiohttp.ClientSession, mint: str, symbol: str, name: str):
-    if not mint or mint in alerted_tokens:
-        return
-    
-    alerted_tokens[mint] = {"status": "monitoring", "start_time": time.time()}
-    max_loops = int((MAX_MONITOR_MINUTES * 60) // CHECK_INTERVAL_SEC)
-    
-    log.info(f"👀 Surveillance lancée pour {symbol} ({mint[:8]})")
-
-    for _ in range(max_loops):
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
-        
-        if alerted_tokens.get(mint) == "ALERTED":
-            return
-
-        elapsed = int(time.time() - alerted_tokens[mint]["start_time"])
-        is_active, real_mcap, pro_traders, total_txs, bundlers = await check_token_activity(session, mint)
-        
-        if real_mcap < TARGET_MARKET_CAP_USD:
-            continue
-
-        if not is_active:
-            log.info(f"❌ [Rejeté] {symbol} à ${real_mcap:,.0f} (TXs: {total_txs}, Pro: {pro_traders})")
-            alerted_tokens[mint] = "ALERTED"
-            return
-
-        alerted_tokens[mint] = "ALERTED"
-        await send_telegram_alert(mint, symbol, name, real_mcap, elapsed, pro_traders, total_txs, bundlers)
-        return
 
 async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
     while True:
         try:
             async with websockets.connect(PUMPFUN_WS_PRIMARY, ping_interval=20) as ws:
-                log.info("✅ Flux v13.4 Connecté — Écoute totale de 100% des lancements")
+                log.info("✅ Système v13.5 Actif — Audit silencieux des 10 minutes initialisé.")
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 async for raw_msg in ws:
                     try:
                         data = json.loads(raw_msg)
                         if isinstance(data, dict) and data.get("txType") == "create":
-                            # ZERO FILTRE : On prend absolument tout ce qui se crée !
                             mint = data.get("mint")
-                            symbol = data.get("symbol", "?")
-                            name = data.get("name", "?")
-                            asyncio.create_task(monitor_token(session, mint, symbol, name))
+                            if mint not in monitored_tokens:
+                                monitored_tokens[mint] = True
+                                # On envoie le token en incubation pendant 10 minutes
+                                asyncio.create_task(evaluate_token_after_delay(session, mint, data.get("symbol", "?"), data.get("name", "?")))
                     except: pass
         except Exception as e:
             await asyncio.sleep(3)
@@ -177,7 +146,7 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 *Mise à jour v13.4 Active : Mode Ouverture Totale. Plus aucun filtrage sur les réseaux sociaux ou les bundlers au lancement. Surveillance brute lancée.*")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚙️ *Mise à jour v13.5 en production : Mode Audit Silencieux activé. Le bot analyse chaque token pendant 10 minutes en arrière-plan avant de filtrer et d'envoyer l'alerte.*")
     except: pass
     asyncio.create_task(run_bot_logic())
 

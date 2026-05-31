@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║      SOLANA PUMP.FUN SNIPER BOT — ELITE FILTER v15.6         ║
+║      SOLANA PUMP.FUN SNIPER BOT — ELITE FILTER v15.7         ║
 ║   Audit post 10-Min : MCAP, VOLUME, LIQUIDITÉ, HOLDERS, TXS  ║
-║   Logs en temps réel activés pour un suivi transparent       ║
+║   Volume ajusté à 15K$ pour une détection plus agile         ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -24,9 +24,9 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # CONFIGURATION DU CHRONO STRATÉGIQUE
 WAIT_TIME_SECONDS = 600            # Attente obligatoire de 10 minutes (600s)
 
-# CONFIGURATION DES FILTRES ÉLITES (v15.6)
+# CONFIGURATION DES FILTRES ÉLITES AJUSTÉS (v15.7)
 MIN_MCAP = 6000.0                  # Market Cap Minimum : 6K$
-MIN_VOLUME = 50000.0               # Volume Minimum après 10 min : 50K$
+MIN_VOLUME = 15000.0               # Volume Minimum après 10 min : Abissé à 15K$ 🎯
 MIN_LIQUIDITY = 4000.0             # Liquidité Minimum dans la Pool : 4K$
 MIN_HOLDERS = 50                   # Minimum 50 Holders uniques estimés
 MIN_TXS = 300                      # Minimum 300 Transactions au total
@@ -71,7 +71,7 @@ async def evaluate_token_after_delay(session: aiohttp.ClientSession, mint: str, 
             sells_usd = float(pair.get("volume", {}).get("sells", 0))
             total_vol = buys_usd + sells_usd
             
-            # 3. Analyse Transactions & Holders (Extraction sécurisée des structures m5)
+            # 3. Analyse Transactions & Holders
             txns_m5 = pair.get("txns", {}).get("m5", {})
             tx_buys = int(txns_m5.get("buys", 0)) * 2
             tx_sells = int(txns_m5.get("sells", 0)) * 2
@@ -111,19 +111,19 @@ async def send_explosion_alert(mint: str, symbol: str, name: str, mcap: float, t
     link_dex = f"https://dexscreener.com/solana/{mint}"
 
     msg = (
-        "💎 *PÉPITE SÉLECTIONNÉE (v15.6 ÉLITE)* 💎\n"
+        "💎 *PÉPITE SÉLECTIONNÉE (v15.7 ÉLITE)* 💎\n"
         f"• *Nom :* {clean_name} ({clean_symbol})\n"
         f"• *Mint :* `{mint}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *METRICS DE VALIDATION POST-10 MIN*\n"
         f"├ 💰 Market Cap : *${mcap:,.0f}* (Min 6K$) ✅\n"
-        f"├ 💵 Volume Global : *${total_vol:,.0f}* (Min 50K$) ✅\n"
+        f"├ 💵 Volume Global : *${total_vol:,.0f}* (Min 15K$) 🎯\n"
         f"├ 💧 Liquidité Pool : *${liquidity:,.0f}* (Min 4K$) 🟢\n"
         f"├ 👥 Holders Uniques : *~{holders}* (Min 50) 👥\n"
         f"├ 📈 Activité : *{total_txs} TXs* (Min 300) ✅\n"
         f"└ ⛓️ Info structure : *{bundlers:.2f}%* ℹ️\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 *RAPPORT :* Structure validée, volume organique et liquidité solide après 10 minutes d'existence.\n\n"
+        "🎯 *RAPPORT :* Entrée de volume validée à plus de 15K$. Idéal pour se positionner sur un décollage organique.\n\n"
         f"🔗 [Acheter sur Axiom Pro]({link_axiom}) | [DexScreener]({link_dex})"
     )
     
@@ -140,7 +140,7 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
     while True:
         try:
             async with websockets.connect(PUMPFUN_WS_PRIMARY, ping_interval=20) as ws:
-                log.info("✅ Filtre Élite v15.6 Actif — Surveillance des lancements en cours.")
+                log.info("✅ Filtre Élite v15.7 Actif — Surveillance avec Volume Min à 15K$.")
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 async for raw_msg in ws:
                     try:
@@ -151,7 +151,6 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
                             
                             if mint not in monitored_tokens:
                                 monitored_tokens[mint] = True
-                                # LOG DIRECT : S'affiche instantanément à chaque création sur Pump.fun
                                 log.info(f"📥 [Flux Pump.fun] Nouveau jeton détecté : {symbol} ({mint[:8]}...) -> Incubation 10 min lancée.")
                                 
                                 asyncio.create_task(evaluate_token_after_delay(session, mint, symbol, data.get("name", "?")))
@@ -164,7 +163,7 @@ async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
 @app.on_event("startup")
 async def startup_event():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚙️ *Mise à jour v15.6 déployée.* Affichage du flux live corrigé et actif !")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚙️ *Mise à jour v15.7 appliquée.* Le volume minimum requis est désormais fixé à *15 000 $* après 10 minutes.")
     except Exception:
         pass
     asyncio.create_task(run_bot_logic())

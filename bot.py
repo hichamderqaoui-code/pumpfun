@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║    SOLANA PUMP.FUN SNIPER BOT — INSIDER 10K TRACKER v17.0    ║
+║    SOLANA PUMP.FUN SNIPER BOT — INSIDER 10K TRACKER v17.1    ║
 ║   Détection en DIRECT sur Pump.fun AVANT la migration Raydium ║
-║   Alerte instantanée dès qu'un token franchit 10K$ de MCAP   ║
+║   Correction stricte des blocs d'indentation (try/except)   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -64,22 +64,3 @@ async def send_insider_alert(mint: str, symbol: str, name: str, mcap: float, tot
     
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-    except Exception as e:
-        log.error(f"Erreur d'envoi Telegram : {e}")
-
-# ══════════════════════════════════════════════════════════════
-# TRAITEMENT DU FLUX DES TRADES EN TEMPS RÉEL
-# ══════════════════════════════════════════════════════════════
-
-async def connect_pumpfun_websocket(session: aiohttp.ClientSession):
-    global token_stats, alerted_tokens
-    while True:
-        try:
-            async with websockets.connect(PUMPFUN_WS_PRIMARY, ping_interval=20) as ws:
-                log.info("✅ Sniper Insider v17.0 Actif — Chasse des tokens à 10K$ sur Pump.fun...")
-                
-                # On s'abonne aux TRADES en direct (chaque achat/vente sur Pump.fun global)
-                await ws.send(json.dumps({"method": "subscribeTokenTrade"}))
-                
-                async for raw_msg in ws:
-                    try:

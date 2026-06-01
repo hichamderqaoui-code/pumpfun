@@ -1,66 +1,115 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║    SOLANA PUMP.FUN SNIPER BOT — INSIDER 10K TRACKER v17.1    ║
-║   Détection en DIRECT sur Pump.fun AVANT la migration Raydium ║
-║   Correction stricte des blocs d'indentation (try/except)   ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-
-import asyncio
-import aiohttp
-import json
-import os
-import logging
-import websockets
-from telegram import Bot
-from telegram.constants import ParseMode
-from fastapi import FastAPI
-
-# GLOBALES DE CONFIGURATION
-PUMPFUN_WS_PRIMARY = "wss://pumpportal.fun/api/data"
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-# SEUILS STRATÉGIQUES SUR PUMP.FUN (AVANT MIGRATION)
-TARGET_MCAP_PUMP = 10000.0         # Alerte dès que le Market Cap franchit 10K$ sur Pump.fun
-MIN_TRADES_COUNT = 15              # Minimum 15 transactions pour valider l'intérêt organique
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-bot = Bot(token=TELEGRAM_TOKEN)
-app = FastAPI()
-
-# Dictionnaires de suivi en mémoire vive
-token_stats = {}
-alerted_tokens = set()
+        log.info(f" Alerte Telegram envoyée pour {clean_symbol} (MCap: ${mcap:,.0f})")
+    except Exception as e:
+        log.error(f"❌ Erreur lors de l'envoi Telegram pour {mint}: {e}")
 
 # ══════════════════════════════════════════════════════════════
-# ENVOI DE L'ALERTE INSIDER (10K EN COURS SUR PUMP.FUN)
+# ANALYSE ET FILTRAGE DU FLUX DE TRADES EN DIRECT
 # ══════════════════════════════════════════════════════════════
 
-async def send_insider_alert(mint: str, symbol: str, name: str, mcap: float, total_vol: float, total_txs: int):
-    clean_name = name.replace('*', '').replace('_', '').replace('`', '')
-    clean_symbol = symbol.replace('*', '').replace('_', '').replace('`', '')
-    
-    # Liens optimisés pour l'achat immédiat avant migration
-    link_axiom = f"https://axiom.trade/token/{mint}"
-    link_pump = f"https://pump.fun/{mint}"
-
-    msg = (
-        "🚨 *ALERTE SNIPER : FRANCHISSEMENT 10K$ !* 🚨\n"
-        f"• *Nom :* {clean_name} ({clean_symbol})\n"
-        f"• *Mint :* `{mint}`\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📈 *DONNÉES LIVE (SUR PUMP.FUN)*\n"
-        f"├ 💰 Market Cap Actuel : *${mcap:,.0f}* 🎯\n"
-        f"├ 💵 Volume injecté : *${total_vol:,.0f}*\n"
-        f"├ 📊 Nombre de Trades : *{total_txs} transactions*\n"
-        f"└ ⛓️ Statut : *En cours de Bonding Curve* ⏳\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 *STRATÉGIE :* Ce token vient d'exploser le plafond des 10K$ sur Pump.fun avec une bonne dynamique. Il n'a pas encore migré !\n\n"
-        f"🔗 [Acheter Direct sur Axiom Pro]({link_axiom}) | [Voir sur Pump.fun]({link_pump})"
-    )
-    
+async def process_trade_event(event: dict):
+    """
+    Analyse chaque transaction en direct sur Pump.fun.
+    Calcule le volume cumulé, le nombre de trades et vérifie le Market Cap.
+    """
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        mint = event.get("mint")
+        if not mint or mint in alerted_tokens:
+            return
+
+        # Extraction des données de prix/sol du trade
+        sol_amount = float(event.get("solAmount", 0)) / 1e9  # Converti de Lamports en SOL
+        # Approximation du prix du SOL à ~150$ pour un calcul rapide du volume en USD (ajustable)
+        trade_vol_usd = sol_amount * 150.0 
+
+        # Simulation du Market Cap basé sur le marketCapSol fourni par l'API
+        mcap_sol = float(event.get("marketCapSol", 0))
+        mcap_usd = mcap_sol * 150.0
+
+        # Initialisation ou mise à jour des stats du token
+        if mint not in token_stats:
+            token_stats[mint] = {
+                "symbol": event.get("symbol", "UNKNOWN"),
+                "name": event.get("name", "Unknown Token"),
+                "total_vol": 0.0,
+                "tx_count": 0
+            }
+
+        stats = token_stats[mint]
+        stats["total_vol"] += trade_vol_usd
+        stats["tx_count"] += 1
+
+        # Vérification des critères de déclenchement (10K+ Market Cap & volume organique)
+        if mcap_usd >= TARGET_MCAP_PUMP and stats["tx_count"] >= MIN_TRADES_COUNT:
+            alerted_tokens.add(mint)
+            asyncio.create_task(
+                send_insider_alert(
+                    mint=mint,
+                    symbol=stats["symbol"],
+                    name=stats["name"],
+                    mcap=mcap_usd,
+                    total_vol=stats["total_vol"],
+                    total_txs=stats["tx_count"]
+                )
+            )
+            # Nettoyage de la mémoire vive pour ce token
+            token_stats.pop(mint, None)
+
+    except Exception as e:
+        log.error(f"❌ Erreur lors du traitement du trade event : {e}")
+
+# ══════════════════════════════════════════════════════════════
+# CONNEXION WEBSOCKET ET GESTION DU FLUX (PUMP PORTAL)
+# ══════════════════════════════════════════════════════════════
+
+async def monitor_pump_fun():
+    """
+    Se connecte au WebSocket de Pump Portal, s'abonne aux trades
+    et gère les reconnexions automatiques.
+    """
+    while True:
+        try:
+            log.info(f" Connexion au WebSocket Pump Portal : {PUMPFUN_WS_PRIMARY}")
+            async with websockets.connect(PUMPFUN_WS_PRIMARY, ping_interval=20, ping_timeout=10) as ws:
+                
+                # Abonnement au flux de tous les trades de la plateforme
+                subscribe_payload = {
+                    "method": "subscribeAllTokenTrades"
+                }
+                await ws.send(json.dumps(subscribe_payload))
+                log.info(" Abonnés avec succès au flux global des trades Pump.fun.")
+
+                async for message in ws:
+                    data = json.loads(message)
+                    
+                    # Ignorer les messages de confirmation d'abonnement
+                    if "message" in data and "subscribed" in data.get("message", ""):
+                        continue
+                        
+                    await process_trade_event(data)
+
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning(f"⚠️ Connexion WebSocket perdue ({e}). Reconnexion dans 5 secondes...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            log.error(f"❌ Erreur critique dans la boucle principale : {e}. Nouvelle tentative...")
+            await asyncio.sleep(5)
+
+# ══════════════════════════════════════════════════════════════
+# CYCLE DE VIE FASTAPI (LANCEMENT SUR RAILWAY)
+# ══════════════════════════════════════════════════════════════
+
+@app.on_event("startup")
+async def startup_event():
+    """Déclenche le bot en tâche de fond dès que Railway démarre Uvicorn."""
+    log.info("🚀 Lancement du Worker Pump.fun Sniper Bot en tâche de fond...")
+    asyncio.create_task(monitor_pump_fun())
+
+@app.get("/")
+async def root():
+    """Route de Healthcheck pour que Railway sache que le conteneur est vivant."""
+    return {
+        "status": "online",
+        "bot": "Solana Pump.fun Sniper v17.1",
+        "tracked_tokens_in_memory": len(token_stats),
+        "alerts_sent_session": len(alerted_tokens)
+    }

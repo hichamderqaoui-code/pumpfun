@@ -35,7 +35,7 @@ async def send_telegram_alert(message: str):
 
 def analyser_et_alerter(trade_data: dict):
     """
-    Analyse chaque transaction en temps réel pour traquer l'évolution du Market Cap
+    Analyse chaque transaction en temps réel reçue pour les tokens suivis
     """
     mint = trade_data.get("mint")
     if not mint or mint in alerted_tokens:
@@ -44,14 +44,14 @@ def analyser_et_alerter(trade_data: dict):
     name = trade_data.get("name", "Unknown Token")
     symbol = trade_data.get("symbol", "MEME")
     
-    # Récupération et calcul du Market Cap en USD (Prix du SOL indicatif à 150$)
+    # Calcul du Market Cap en USD (Prix du SOL estimé à 150$)
     mcap_sol = trade_data.get("marketCapSol", 0)
     mcap_usd = mcap_sol * 150  
 
-    # Ligne de log systématique pour voir le stream défiler en direct
-    print(f"[STREAM] Token: {name} ({symbol}) | MCap actuel : {mcap_usd:,.0f}$")
+    # Affiche l'activité dans les logs Railway
+    print(f"[STREAM] {name} ({symbol}) | MCap actuel : {mcap_usd:,.0f}$")
 
-    # Vérification de ta stratégie (Fenêtre autour des 10k$)
+    # Évaluation du filtre stratégique (zone des 10k$)
     if TARGET_MIN_MCAP <= mcap_usd <= TARGET_MAX_MCAP:
         print(f"[BOT] 🎯 CRITÈRE VALIDÉ : {name} entre dans la zone cible ! ({mcap_usd:,.0f}$)")
         
@@ -73,22 +73,38 @@ def analyser_et_alerter(trade_data: dict):
         asyncio.create_task(send_telegram_alert(message))
 
 async def solana_websocket_listener():
-    """Se connecte au flux complet des transactions Pumpportal"""
+    """
+    Moteur WebSocket hybride : s'abonne aux créations globales puis injecte 
+    les tokens dynamiquement dans le flux de transactions (Trades).
+    """
     uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Démarrage du moteur WebSocket (Analyse des flux) ===")
+    print("=== [BOT] Démarrage du moteur WebSocket hybride ===")
 
     while True:
         try:
             async with websockets.connect(uri) as websocket:
-                print("[WEBSOCKET] ✅ Canal ouvert. Injection des filtres de souscription...")
+                print("[WEBSOCKET] ✅ Canal ouvert. Activation du flux des créations...")
                 
-                # Écoute des transactions en direct
-                await websocket.send(json.dumps({"method": "subscribeTokenTrade"}))
-                print("[WEBSOCKET] 📡 Flux de tracking des prix activé H24.")
+                # Écoute globale de chaque nouveau jeton créé
+                await websocket.send(json.dumps({"method": "subscribeNewToken"}))
+                print("[WEBSOCKET] 📡 Surveillance globale initialisée.")
 
                 async for message in websocket:
                     data = json.loads(message)
-                    if "mint" in data and "marketCapSol" in data:
+                    
+                    # Cas 1 : C'est un nouveau jeton qui vient de naître
+                    if data.get("txType") == "create" or "initialBuy" in data:
+                        mint = data.get("mint")
+                        if mint:
+                            # On ordonne immédiatement au même WebSocket d'écouter les transactions de ce jeton spécifique
+                            # (La documentation exige d'envoyer les nouvelles clés sur la même connexion existante)
+                            await websocket.send(json.dumps({
+                                "method": "subscribeTokenTrade",
+                                "keys": [mint]
+                            }))
+                    
+                    # Cas 2 : C'est une transaction sur l'un de nos jetons suivis
+                    elif "mint" in data and "marketCapSol" in data:
                         analyser_et_alerter(data)
                         
         except websockets.exceptions.ConnectionClosed:
@@ -98,7 +114,7 @@ async def solana_websocket_listener():
             print(f"[WEBSOCKET] ❌ Alerte dysfonctionnement : {e}")
             await asyncio.sleep(5)
 
-# ─── ATTRIBUT CRUCIAL REQUIS PAR UVICORN / RAILWAY ───
+# --- LIFESPAN FASTAPI POUR RAILWAY ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     bot_task = asyncio.create_task(solana_websocket_listener())
@@ -106,9 +122,8 @@ async def lifespan(app: FastAPI):
     bot_task.cancel()
     await bot_task
 
-# C'est cette variable exacte "app" qui manquait dans ton code !
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "active", "mode": "Full Trade Stream Monitoring"}
+    return {"status": "active", "mode": "Hybrid Stream (New Tokens + Live Trades)"}

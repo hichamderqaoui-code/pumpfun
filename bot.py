@@ -17,10 +17,10 @@ SOL_PRICE_USD       = float(os.getenv("SOL_PRICE_USD",       "75.33"))
 MIN_HOLDERS         = int(os.getenv("MIN_HOLDERS",           "50"))
 MIN_VOLUME_USD      = float(os.getenv("MIN_VOLUME_USD",      "5000"))
 MIN_LIQUIDITY_USD   = float(os.getenv("MIN_LIQUIDITY_USD",   "5000"))
-MIN_AGE_SECONDS     = int(os.getenv("MIN_AGE_SECONDS",       "120"))   # 2 min minimum
-MAX_TOP10_PCT       = float(os.getenv("MAX_TOP10_PCT",        "30.0")) # top10 holders < 30%
-MIN_TXS_5MIN        = int(os.getenv("MIN_TXS_5MIN",          "20"))    # >20 tx sur 5 min
-POLL_INTERVAL       = 10
+MIN_AGE_SECONDS     = int(os.getenv("MIN_AGE_SECONDS",       "120"))
+MAX_TOP10_PCT       = float(os.getenv("MAX_TOP10_PCT",        "30.0"))
+MIN_TXS_5MIN        = int(os.getenv("MIN_TXS_5MIN",          "20"))
+POLL_INTERVAL       = 15  # 15s entre chaque cycle pour éviter le rate limit
 
 tracked_new_tokens = OrderedDict()
 MAX_TRACKED = 500
@@ -43,12 +43,12 @@ def register_new_token(data: dict):
 
 
 async def send_telegram_alert(message: str, is_test: bool = False):
-    token    = str(TELEGRAM_TOKEN).strip()
-    chat_id  = str(TELEGRAM_CHAT_ID).strip()
-    url      = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload  = {"chat_id": chat_id, "text": message}
+    token   = str(TELEGRAM_TOKEN).strip()
+    chat_id = str(TELEGRAM_CHAT_ID).strip()
+    url     = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
     if not is_test:
-        payload["parse_mode"]             = "Markdown"
+        payload["parse_mode"]              = "Markdown"
         payload["disable_web_page_preview"] = True
     try:
         async with httpx.AsyncClient() as client:
@@ -62,31 +62,34 @@ async def send_telegram_alert(message: str, is_test: bool = False):
 
 
 async def check_token_dexscreener(mint: str) -> dict:
+    """Retourne les données clés du token depuis DexScreener"""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.get(url)
-            data = r.json()
-            pairs = data.get("pairs", [])
+            # ✅ Vérifie que la réponse est bien du JSON avant de parser
+            content_type = r.headers.get("content-type", "")
+            if r.status_code != 200 or "application/json" not in content_type:
+                return {}
+            try:
+                data = r.json()
+            except Exception:
+                return {}
+
+            pairs = data.get("pairs")
             if not pairs:
                 return {}
+
             p = pairs[0]
 
-            # Transactions sur 5 min
-            txs_5m = 0
-            txns = p.get("txns", {})
-            m5   = txns.get("m5", {})
+            txns   = p.get("txns") or {}
+            m5     = txns.get("m5") or {}
             txs_5m = int(m5.get("buys", 0)) + int(m5.get("sells", 0))
 
-            # Variation de prix sur 5 min
             price_change_5m = float((p.get("priceChange") or {}).get("m5") or 0)
 
-            # Top 10 holders % (si dispo dans info)
-            info = p.get("info") or {}
+            info      = p.get("info") or {}
             top10_pct = float(info.get("top10HolderPercent") or 0) * 100
-
-            # Mint authority (si dispo)
-            mint_disabled = info.get("mintAuthorityDisabled", None)
 
             return {
                 "mcap_usd":        float(p.get("fdv") or p.get("marketCap") or 0),
@@ -96,78 +99,49 @@ async def check_token_dexscreener(mint: str) -> dict:
                 "txs_5m":          txs_5m,
                 "price_change_5m": price_change_5m,
                 "top10_pct":       top10_pct,
-                "mint_disabled":   mint_disabled,
             }
     except Exception as e:
-        print(f"[DEXSCREENER] ❌ Erreur {mint[:8]} : {e}")
+        print(f"[DEXSCREENER] ❌ {mint[:8]} : {e}")
         return {}
 
 
-def calculer_score(d: dict, elapsed: float) -> tuple[int, list[str]]:
-    """Retourne un score /100 et la liste des points forts"""
+def calculer_score(d: dict, elapsed: float) -> tuple:
     score  = 0
     points = []
 
-    # Holders (max 20 pts)
     h = d["holders"]
-    if h >= 200:
-        score += 20; points.append("👥 Holders solides (200+)")
-    elif h >= 100:
-        score += 14; points.append("👥 Bons holders (100+)")
-    elif h >= 50:
-        score += 8
+    if h >= 200:   score += 20; points.append("👥 Holders solides (200+)")
+    elif h >= 100: score += 14; points.append("👥 Bons holders (100+)")
+    elif h >= 50:  score += 8
 
-    # Volume (max 20 pts)
     v = d["volume_usd"]
-    if v >= 50000:
-        score += 20; points.append("📊 Volume fort (50K$+)")
-    elif v >= 20000:
-        score += 14; points.append("📊 Volume correct (20K$+)")
-    elif v >= 5000:
-        score += 8
+    if v >= 50000:   score += 20; points.append("📊 Volume fort (50K$+)")
+    elif v >= 20000: score += 14; points.append("📊 Volume correct (20K$+)")
+    elif v >= 5000:  score += 8
 
-    # Liquidité (max 20 pts)
     liq = d["liquidity"]
-    if liq >= 20000:
-        score += 20; points.append("💧 Liquidité forte (20K$+)")
-    elif liq >= 10000:
-        score += 14; points.append("💧 Bonne liquidité (10K$+)")
-    elif liq >= 5000:
-        score += 8
+    if liq >= 20000:  score += 20; points.append("💧 Liquidité forte (20K$+)")
+    elif liq >= 10000: score += 14; points.append("💧 Bonne liquidité (10K$+)")
+    elif liq >= 5000:  score += 8
 
-    # Transactions 5 min (max 15 pts)
     tx = d["txs_5m"]
-    if tx >= 100:
-        score += 15; points.append("⚡ Activité intense (100+ tx/5min)")
-    elif tx >= 50:
-        score += 10; points.append("⚡ Bonne activité (50+ tx/5min)")
-    elif tx >= 20:
-        score += 6
+    if tx >= 100:  score += 15; points.append("⚡ Activité intense (100+ tx/5min)")
+    elif tx >= 50: score += 10; points.append("⚡ Bonne activité (50+ tx/5min)")
+    elif tx >= 20: score += 6
 
-    # Prix en hausse sur 5 min (max 15 pts)
     pc = d["price_change_5m"]
-    if pc >= 20:
-        score += 15; points.append("📈 Momentum fort (+20%/5min)")
-    elif pc >= 5:
-        score += 10; points.append("📈 Momentum positif (+5%/5min)")
-    elif pc > 0:
-        score += 5
+    if pc >= 20:  score += 15; points.append("📈 Momentum fort (+20%/5min)")
+    elif pc >= 5: score += 10; points.append("📈 Momentum positif (+5%/5min)")
+    elif pc > 0:  score += 5
 
-    # Top 10 holders (max 10 pts)
     t10 = d["top10_pct"]
-    if 0 < t10 <= 15:
-        score += 10; points.append("🔒 Distribution saine (<15%)")
-    elif t10 <= 25:
-        score += 6
-    elif t10 <= 30:
-        score += 2
+    if 0 < t10 <= 15:   score += 10; points.append("🔒 Distribution saine (<15%)")
+    elif t10 <= 25: score += 6
+    elif t10 <= 30: score += 2
 
-    # Âge (bonus jusqu'à 10 pts) — ni trop rapide ni trop lent
     mins = elapsed / 60
-    if 3 <= mins <= 7:
-        score += 10; points.append(f"⏱️ Timing idéal ({mins:.0f} min)")
-    elif 2 <= mins <= 10:
-        score += 5
+    if 3 <= mins <= 7:  score += 10; points.append(f"⏱️ Timing idéal ({mins:.0f} min)")
+    elif 2 <= mins <= 10: score += 5
 
     return min(score, 100), points
 
@@ -183,6 +157,7 @@ async def monitor_tokens():
     while True:
         now   = time.time()
         mints = list(tracked_new_tokens.keys())
+        checked = 0
 
         for mint in mints:
             token_info = tracked_new_tokens.get(mint)
@@ -191,13 +166,18 @@ async def monitor_tokens():
 
             elapsed = now - token_info["created_at"]
 
+            # Trop vieux → abandon
             if elapsed > MAX_AGE_SECONDS:
                 token_info["alerted"] = True
                 continue
 
-            # Pas encore assez vieux
+            # Pas encore indexé sur DexScreener → skip
             if elapsed < MIN_AGE_SECONDS:
                 continue
+
+            checked += 1
+            # ✅ Petit délai entre chaque appel pour éviter le rate limit DexScreener
+            await asyncio.sleep(0.5)
 
             d = await check_token_dexscreener(mint)
             if not d:
@@ -217,29 +197,22 @@ async def monitor_tokens():
                 f"Vol:{volume:>7,.0f}$ | "
                 f"Liq:{liquidity:>7,.0f}$ | "
                 f"H:{holders:>4} | "
-                f"Tx5m:{txs_5m:>4} | "
-                f"Δ5m:{pc_5m:>+6.1f}% | "
+                f"Tx5m:{txs_5m:>3} | "
+                f"Δ:{pc_5m:>+5.1f}% | "
                 f"{elapsed:.0f}s"
             )
 
-            # ── MC minimum ──
             if mcap_usd < TARGET_MCAP_USD:
                 continue
 
             # ── Filtres obligatoires ──
             reasons = []
-            if holders < MIN_HOLDERS:
-                reasons.append(f"holders {holders}<{MIN_HOLDERS}")
-            if volume < MIN_VOLUME_USD:
-                reasons.append(f"vol {volume:,.0f}$<{MIN_VOLUME_USD:,.0f}$")
-            if liquidity < MIN_LIQUIDITY_USD:
-                reasons.append(f"liq {liquidity:,.0f}$<{MIN_LIQUIDITY_USD:,.0f}$")
-            if txs_5m < MIN_TXS_5MIN:
-                reasons.append(f"tx5m {txs_5m}<{MIN_TXS_5MIN}")
-            if top10 > MAX_TOP10_PCT and top10 > 0:
-                reasons.append(f"top10 {top10:.0f}%>{MAX_TOP10_PCT:.0f}%")
-            if pc_5m <= 0:
-                reasons.append(f"prix baisse ({pc_5m:+.1f}%/5min)")
+            if holders  < MIN_HOLDERS:      reasons.append(f"holders {holders}<{MIN_HOLDERS}")
+            if volume   < MIN_VOLUME_USD:   reasons.append(f"vol {volume:,.0f}$<{MIN_VOLUME_USD:,.0f}$")
+            if liquidity < MIN_LIQUIDITY_USD: reasons.append(f"liq {liquidity:,.0f}$<{MIN_LIQUIDITY_USD:,.0f}$")
+            if txs_5m   < MIN_TXS_5MIN:    reasons.append(f"tx5m {txs_5m}<{MIN_TXS_5MIN}")
+            if top10    > MAX_TOP10_PCT and top10 > 0: reasons.append(f"top10 {top10:.0f}%>{MAX_TOP10_PCT:.0f}%")
+            if pc_5m    <= 0:              reasons.append(f"prix baisse ({pc_5m:+.1f}%)")
 
             if reasons:
                 print(f"[FILTRE] ❌ {token_info['name']} → {' | '.join(reasons)}")
@@ -256,11 +229,9 @@ async def monitor_tokens():
             time_str = f"{mins_e}m {secs_e}s" if mins_e > 0 else f"{secs_e}s"
             mult     = 100000 / mcap_usd if mcap_usd > 0 else 10
             em       = emoji_score(score)
+            points_str = "\n".join(f"  {p}" for p in points) if points else "  —"
 
-            print(f"🎯 [ALERTE] {name} | Score: {score}/100 | {mcap_usd:,.0f}$ | {time_str}")
-
-            # ── Points forts formatés ──
-            points_str = "\n".join(f"  {p}" for p in points) if points else "  (aucun point fort)"
+            print(f"🎯 [ALERTE] {name} | Score:{score}/100 | {mcap_usd:,.0f}$ | {time_str}")
 
             message = (
                 f"{em} *SIGNAL {score}/100 — ANALYSE AVANT ENTRÉE*\n\n"
@@ -285,6 +256,9 @@ async def monitor_tokens():
             )
             await send_telegram_alert(message)
 
+        if checked > 0:
+            print(f"[MONITOR] Cycle terminé — {checked} tokens vérifiés")
+
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -299,7 +273,7 @@ async def solana_websocket_listener():
         f"💧 Min liquidité : `{MIN_LIQUIDITY_USD:,.0f}$`\n"
         f"⚡ Min tx/5min : `{MIN_TXS_5MIN}`\n"
         f"🔒 Max top10 : `{MAX_TOP10_PCT:.0f}%`\n"
-        f"⏱️ Âge min : `{MIN_AGE_SECONDS//60} min` | max : `{MAX_AGE_SECONDS//60} min`\n\n"
+        f"⏱️ Fenêtre : `{MIN_AGE_SECONDS//60}-{MAX_AGE_SECONDS//60} min`\n\n"
         "🟢 Score ≥80 | 🟡 ≥60 | 🔴 <60",
         is_test=True
     )

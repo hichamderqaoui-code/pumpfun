@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 import websockets
 
 # ─── REMPLACE DIRECTEMENT ICI AVEC TES VRAIES INFOS ───
-TELEGRAM_TOKEN = "7334791054:AAESiW4P_XG-S..."  # Mets ton token complet ici entre les guillemets
-TELEGRAM_CHAT_ID = "5798765432"  # Mets ton chat ID ici (sans guillemets si c'est un nombre, ou avec)
+TELEGRAM_TOKEN = "8659214495:AAGN0uPMlXfsybXfrPZlGCsmsCisIevNc_g"  # Mets ton token complet ici entre les guillemets
+TELEGRAM_CHAT_ID =  1532612243 # Mets ton chat ID ici (sans guillemets si c'est un nombre, ou avec)
 
 # Stratégie : Détection précise autour de la zone des 10k$ de Market Cap
 TARGET_MIN_MCAP = 9500     

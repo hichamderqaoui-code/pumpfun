@@ -6,9 +6,10 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import websockets
 
-# ─── REMPLACE DIRECTEMENT ICI AVEC TES VRAIES INFOS ───
-TELEGRAM_TOKEN = "8659214495:AAGN0uPMlXfsybXfrPZlGCsmsCisIevNc_g"  # Mets ton token complet ici entre les guillemets
-TELEGRAM_CHAT_ID =  1532612243 # Mets ton chat ID ici (sans guillemets si c'est un nombre, ou avec)
+# ─── CONFIGURATION DIRECTE ET SÉCURISÉE ───
+# Mets bien tes identifiants entre les guillemets ici
+TELEGRAM_TOKEN = "8659214495:AAGN0uPMlXfsybXfrPZlGCsmsCisIevNc_g"  
+TELEGRAM_CHAT_ID = "1532612243"  
 
 # Stratégie : Détection précise autour de la zone des 10k$ de Market Cap
 TARGET_MIN_MCAP = 9500     
@@ -16,34 +17,43 @@ TARGET_MAX_MCAP = 15000
 
 alerted_tokens = set()
 
-async def send_telegram_alert(message: str):
+async def send_telegram_alert(message: str, is_test: bool = False):
     """Gère l'envoi des notifications sur ton Telegram"""
-    # Utilisation prioritaire des chaînes en dur configurées au-dessus
-    token = TELEGRAM_TOKEN if "TON_TOKEN" not in TELEGRAM_TOKEN else os.getenv("TELEGRAM_TOKEN")
-    chat_id = TELEGRAM_CHAT_ID if "TON_CHAT" not in TELEGRAM_CHAT_ID else os.getenv("TELEGRAM_CHAT_ID")
     
-    if not token or "TON_TOKEN" in token:
-        print("[TELEGRAM] ❌ Erreur : Le Token Telegram n'est pas configuré dans le code !")
+    # Extraction propre des variables (converties en chaînes de caractères d'office)
+    token = str(TELEGRAM_TOKEN).strip()
+    chat_id = str(TELEGRAM_CHAT_ID).strip()
+    
+    if not token or "METS_ICI" in token:
+        print("[TELEGRAM] ❌ Configuration manquante : Le Token n'est pas rempli.")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
     payload = {
         "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
+        "text": message
     }
+    
+    # Format enrichi uniquement pour les vrais signaux de tokens
+    if not is_test:
+        payload["parse_mode"] = "Markdown"
+        payload["disable_web_page_preview"] = True
+    
+    print(f"[TELEGRAM] ⏳ Tentative d'envoi au Chat ID {chat_id}...")
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, timeout=8.0)
+        async with httpx.AsyncClient(verify=True) as client:
+            response = await client.post(url, json=payload, timeout=10.0)
             if response.status_code != 200:
-                print(f"[TELEGRAM] ❌ Erreur API HTTP {response.status_code}: {response.text}")
+                print(f"[TELEGRAM] ❌ Erreur API HTTP {response.status_code} : {response.text}")
             else:
-                print("[TELEGRAM] ✅ Message de notification envoyé avec succès !")
+                print("[TELEGRAM] ✅ Super ! Message envoyé avec succès sur ton Telegram.")
+    except httpx.HTTPError as http_err:
+        print(f"[TELEGRAM] ❌ Erreur réseau HTTP : {http_err}")
     except Exception as e:
-        print(f"[TELEGRAM] ❌ Erreur critique de connexion : {e}")
+        print(f"[TELEGRAM] ❌ Erreur système inattendue : {e}")
 
-def analyser_et_alerter(trade_data: dict):
+async def analyser_et_alerter(trade_data: dict):
     """Analyse chaque transaction en temps réel reçue pour les tokens suivis"""
     mint = trade_data.get("mint")
     if not mint or mint in alerted_tokens:
@@ -75,16 +85,19 @@ def analyser_et_alerter(trade_data: dict):
             f"📥 *Adresse de contrat (CA) :*\n`{mint}`"
         )
         
-        asyncio.create_task(send_telegram_alert(message))
+        await send_telegram_alert(message, is_test=False)
 
 async def solana_websocket_listener():
     """Moteur WebSocket hybride"""
     uri = "wss://pumpportal.fun/api/data"
     print("=== [BOT] Démarrage du moteur WebSocket hybride ===")
 
-    # Test immédiat au démarrage
-    test_msg = "🚀 *Test Système* : Si tu lis ce message, la liaison Telegram de ton bot fonctionne parfaitement !"
-    asyncio.create_task(send_telegram_alert(test_msg))
+    # Test de démarrage ultra-léger en texte brut
+    test_msg = "🚀 Test de connexion : Le bot est en ligne et prêt à t'envoyer les alertes !"
+    try:
+        await send_telegram_alert(test_msg, is_test=True)
+    except Exception as e:
+        print(f"[BOOT] Impossible de lancer le test Telegram : {e}")
 
     while True:
         try:
@@ -105,7 +118,7 @@ async def solana_websocket_listener():
                                 "keys": [mint]
                             }))
                         elif "marketCapSol" in data:
-                            analyser_et_alerter(data)
+                            await analyser_et_alerter(data)
                         
         except websockets.exceptions.ConnectionClosed:
             print("[WEBSOCKET] ❌ Déconnexion du flux. Relancement dans 5 secondes...")

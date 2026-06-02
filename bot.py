@@ -48,7 +48,7 @@ def analyser_et_alerter(trade_data: dict):
     mcap_sol = trade_data.get("marketCapSol", 0)
     mcap_usd = mcap_sol * 150  
 
-    # Affiche l'activité dans les logs Railway
+    # Affiche l'activité de transaction dans les logs Railway
     print(f"[STREAM] {name} ({symbol}) | MCap actuel : {mcap_usd:,.0f}$")
 
     # Évaluation du filtre stratégique (zone des 10k$)
@@ -74,10 +74,14 @@ def analyser_et_alerter(trade_data: dict):
 
 async def solana_websocket_listener():
     """
-    Moteur WebSocket hybride optimisé pour attraper toutes les créations de jetons
+    Moteur WebSocket hybride avec message de test de connexion Telegram
     """
     uri = "wss://pumpportal.fun/api/data"
     print("=== [BOT] Démarrage du moteur WebSocket hybride ===")
+
+    # 🔥 PIPELINE DE TEST : Envoi immédiat d'un ping sur Telegram au redémarrage
+    test_msg = "🚀 *Lancement du Bot Solana réussi !* Le moteur hybride tourne. En attente d'un token qui franchit les 10k$..."
+    asyncio.create_task(send_telegram_alert(test_msg))
 
     while True:
         try:
@@ -90,23 +94,16 @@ async def solana_websocket_listener():
 
                 async for message in websocket:
                     data = json.loads(message)
-                    
-                    # Extraction sécurisée de la clé du jeton
                     mint = data.get("mint")
                     
                     if mint:
-                        # CORRECTION : Si le payload contient des infos de création ou d'initialisation, 
-                        # ou s'il s'agit d'une signature sans marketCapSol direct, c'est un nouveau token.
                         if "marketCapSol" not in data or data.get("txType") == "create" or "uri" in data:
-                            print(f"[NEW TOKEN] Découverte de : {data.get('name', '???')} ({mint}) -> Lancement du tracking des prix.")
-                            
-                            # Abonnement immédiat aux trades de ce nouveau token spécifique
+                            # Tracking automatique activé
                             await websocket.send(json.dumps({
                                 "method": "subscribeTokenTrade",
                                 "keys": [mint]
                             }))
                         
-                        # Sinon, c'est un événement de transaction sur un token qu'on a mis sous surveillance
                         elif "marketCapSol" in data:
                             analyser_et_alerter(data)
                         
@@ -129,4 +126,4 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "active", "mode": "Hybrid Stream (New Tokens + Live Trades)"}
+    return {"status": "active", "mode": "Hybrid Stream"}

@@ -74,8 +74,7 @@ def analyser_et_alerter(trade_data: dict):
 
 async def solana_websocket_listener():
     """
-    Moteur WebSocket hybride : s'abonne aux créations globales puis injecte 
-    les tokens dynamiquement dans le flux de transactions (Trades).
+    Moteur WebSocket hybride optimisé pour attraper toutes les créations de jetons
     """
     uri = "wss://pumpportal.fun/api/data"
     print("=== [BOT] Démarrage du moteur WebSocket hybride ===")
@@ -92,20 +91,24 @@ async def solana_websocket_listener():
                 async for message in websocket:
                     data = json.loads(message)
                     
-                    # Cas 1 : C'est un nouveau jeton qui vient de naître
-                    if data.get("txType") == "create" or "initialBuy" in data:
-                        mint = data.get("mint")
-                        if mint:
-                            # On ordonne immédiatement au même WebSocket d'écouter les transactions de ce jeton spécifique
-                            # (La documentation exige d'envoyer les nouvelles clés sur la même connexion existante)
+                    # Extraction sécurisée de la clé du jeton
+                    mint = data.get("mint")
+                    
+                    if mint:
+                        # CORRECTION : Si le payload contient des infos de création ou d'initialisation, 
+                        # ou s'il s'agit d'une signature sans marketCapSol direct, c'est un nouveau token.
+                        if "marketCapSol" not in data or data.get("txType") == "create" or "uri" in data:
+                            print(f"[NEW TOKEN] Découverte de : {data.get('name', '???')} ({mint}) -> Lancement du tracking des prix.")
+                            
+                            # Abonnement immédiat aux trades de ce nouveau token spécifique
                             await websocket.send(json.dumps({
                                 "method": "subscribeTokenTrade",
                                 "keys": [mint]
                             }))
-                    
-                    # Cas 2 : C'est une transaction sur l'un de nos jetons suivis
-                    elif "mint" in data and "marketCapSol" in data:
-                        analyser_et_alerter(data)
+                        
+                        # Sinon, c'est un événement de transaction sur un token qu'on a mis sous surveillance
+                        elif "marketCapSol" in data:
+                            analyser_et_alerter(data)
                         
         except websockets.exceptions.ConnectionClosed:
             print("[WEBSOCKET] ❌ Déconnexion du flux. Relancement dans 5 secondes...")

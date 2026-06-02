@@ -11,18 +11,18 @@ import time
 # ─── CONFIG ───
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8659214495:AAGN0uPMlXfsybXfrPZlGCsmsCisIevNc_g")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1532612243")
-TARGET_MCAP_SOL = float(os.getenv("TARGET_MCAP_SOL", "133"))  # ~10 000$ / 75$ SOL
+TARGET_MCAP_USD = float(os.getenv("TARGET_MCAP_USD", "10000"))
 MAX_AGE_SECONDS = int(os.getenv("MAX_AGE_SECONDS", "600"))
 SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "75.33"))
+POLL_INTERVAL = 10  # Vérification DexScreener toutes les 10s
 
 tracked_new_tokens = OrderedDict()
-MAX_TRACKED = 3000
-_websocket = None
+MAX_TRACKED = 500  # Réduit car on poll chaque token
 
 
 def register_new_token(data: dict):
     mint = data.get("mint")
-    if not mint:
+    if not mint or mint in tracked_new_tokens:
         return None
     if len(tracked_new_tokens) >= MAX_TRACKED:
         tracked_new_tokens.popitem(last=False)
@@ -32,7 +32,7 @@ def register_new_token(data: dict):
         "created_at": time.time(),
         "alerted": False
     }
-    print(f"🆕 [NOUVEAU TOKEN] {data.get('name')} enregistré. (mint: {mint[:8]}...)")
+    print(f"🆕 [NOUVEAU TOKEN] {data.get('name')} | {mint[:8]}...")
     return mint
 
 
@@ -55,117 +55,124 @@ async def send_telegram_alert(message: str, is_test: bool = False):
         print(f"[TELEGRAM] ❌ Erreur : {e}")
 
 
-def analyser_transaction(trade_data: dict):
-    mint = trade_data.get("mint")
-    if not mint or mint not in tracked_new_tokens:
-        return
+async def check_mcap_dexscreener(mint: str) -> float:
+    """Retourne le market cap USD depuis DexScreener, 0 si indispo"""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url)
+            data = r.json()
+            pairs = data.get("pairs", [])
+            if pairs:
+                mc = pairs[0].get("fdv") or pairs[0].get("marketCap") or 0
+                return float(mc)
+    except Exception:
+        pass
+    return 0.0
 
-    token_info = tracked_new_tokens[mint]
-    if token_info["alerted"]:
-        return
 
-    now = time.time()
-    elapsed_time = now - token_info["created_at"]
+async def monitor_tokens():
+    """Boucle qui poll DexScreener sur tous les tokens actifs"""
+    print("[MONITOR] 🔍 Démarrage surveillance DexScreener...")
+    while True:
+        now = time.time()
+        # Copie pour éviter les modifications pendant l'itération
+        mints = list(tracked_new_tokens.keys())
 
-    if elapsed_time > MAX_AGE_SECONDS:
-        token_info["alerted"] = True
-        return
+        for mint in mints:
+            token_info = tracked_new_tokens.get(mint)
+            if not token_info or token_info["alerted"]:
+                continue
 
-    mcap_sol = trade_data.get("marketCapSol", 0)
-    mcap_usd = mcap_sol * SOL_PRICE_USD
+            elapsed = now - token_info["created_at"]
 
-    if mcap_sol > 0:
-        print(f"[TRADE] {token_info['name']} | MC: {mcap_sol:.1f} SOL ({mcap_usd:,.0f}$) | Seuil: {TARGET_MCAP_SOL} SOL | {elapsed_time:.0f}s")
+            # Token trop vieux → on abandonne
+            if elapsed > MAX_AGE_SECONDS:
+                token_info["alerted"] = True
+                continue
 
-    if mcap_sol >= TARGET_MCAP_SOL:
-        token_info["alerted"] = True
+            mcap_usd = await check_mcap_dexscreener(mint)
 
-        name = token_info["name"]
-        symbol = token_info["symbol"]
-        minutes = int(elapsed_time // 60)
-        seconds = int(elapsed_time % 60)
-        time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-        multiplier_to_100k = 100000 / mcap_usd if mcap_usd > 0 else 10
+            if mcap_usd > 0:
+                print(f"[POLL] {token_info['name']} | MC: {mcap_usd:,.0f}$ | {elapsed:.0f}s écoulées")
 
-        print(f"🎯 [BOUGIE EXPLOSIVE] {name} → {mcap_sol:.0f} SOL ({mcap_usd:,.0f}$) en {time_str}!")
+            if mcap_usd >= TARGET_MCAP_USD:
+                token_info["alerted"] = True
 
-        message = (
-            "⚡ *PUMP EXPLOSIF (< 10 MIN)*\n\n"
-            f"• *Nom :* {name} ({symbol})\n"
-            f"• *Market Cap :* `{mcap_usd:,.0f}$` ({mcap_sol:.0f} SOL)\n"
-            f"• *Temps depuis création :* `{time_str}` ⏱️\n"
-            f"• *Potentiel vers 100k$ :* `x{multiplier_to_100k:.1f}`\n\n"
-            "📈 *Liens :*\n"
-            f"• [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\n"
-            f"• [BullX](https://bullx.io/terminal?chain=solana&address={mint})\n"
-            f"• [Dexscreener](https://dexscreener.com/solana/{mint})\n\n"
-            "📥 *CA :*\n"
-            f"`{mint}`"
-        )
-        asyncio.create_task(send_telegram_alert(message))
+                name = token_info["name"]
+                symbol = token_info["symbol"]
+                minutes = int(elapsed // 60)
+                seconds = int(elapsed % 60)
+                time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+                multiplier = 100000 / mcap_usd if mcap_usd > 0 else 10
+
+                print(f"🎯 [ALERTE] {name} → {mcap_usd:,.0f}$ en {time_str}!")
+
+                message = (
+                    "🚨 *TOKEN À ANALYSER — 10K$ ATTEINT*\n\n"
+                    f"• *Nom :* {name} ({symbol})\n"
+                    f"• *Market Cap :* `{mcap_usd:,.0f}$`\n"
+                    f"• *Temps depuis création :* `{time_str}` ⏱️\n"
+                    f"• *Potentiel x vers 100k$ :* `x{multiplier:.1f}`\n\n"
+                    "🔍 *Analyse avant entrée :*\n"
+                    f"• [Dexscreener](https://dexscreener.com/solana/{mint})\n"
+                    f"• [RugCheck](https://rugcheck.xyz/tokens/{mint})\n"
+                    f"• [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\n"
+                    f"• [BullX](https://bullx.io/terminal?chain=solana&address={mint})\n\n"
+                    "📥 *CA :*\n"
+                    f"`{mint}`"
+                )
+                await send_telegram_alert(message)
+
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 async def solana_websocket_listener():
-    global _websocket
     uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Démarrage Sniper ===")
+    print("=== [BOT] Démarrage Sniper 10K$ ===")
     await send_telegram_alert(
-        "⏱️ *Sniper Actif*\n"
-        f"Cible : `{TARGET_MCAP_SOL} SOL` (~`{TARGET_MCAP_SOL * SOL_PRICE_USD:,.0f}$`)\n"
-        f"SOL fixé à `{SOL_PRICE_USD}$`",
+        "🚨 *Sniper 10K$ Actif*\n"
+        f"Cible : `{TARGET_MCAP_USD:,.0f}$` en < 10 min\n"
+        f"SOL : `{SOL_PRICE_USD}$`\n"
+        "Surveillance DexScreener toutes les 10s",
         is_test=True
     )
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                _websocket = websocket
                 print("[WEBSOCKET] ✅ Connecté.")
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
-                await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] 📡 Abonné : nouveaux tokens + tous trades.")
+                print("[WEBSOCKET] 📡 Abonné aux nouveaux tokens.")
 
                 async for message in websocket:
                     try:
                         data = json.loads(message)
                     except json.JSONDecodeError:
                         continue
-
-                    tx_type = data.get("txType")
-
-                    if tx_type == "create":
-                        mint = register_new_token(data)
-                        if mint and _websocket:
-                            try:
-                                await _websocket.send(json.dumps({
-                                    "method": "subscribeTokenTrade",
-                                    "keys": [mint]
-                                }))
-                            except Exception:
-                                pass
-
-                    elif tx_type in ("buy", "sell") or "marketCapSol" in data:
-                        analyser_transaction(data)
+                    if data.get("txType") == "create":
+                        register_new_token(data)
 
         except websockets.exceptions.ConnectionClosed:
-            print("[WEBSOCKET] ❌ Déconnecté. Reconnexion dans 3s...")
-            _websocket = None
+            print("[WEBSOCKET] ❌ Reconnexion dans 3s...")
             await asyncio.sleep(3)
         except Exception as e:
             print(f"[WEBSOCKET] ❌ Erreur : {e}")
-            _websocket = None
             await asyncio.sleep(3)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    bot_task = asyncio.create_task(solana_websocket_listener())
+    ws_task = asyncio.create_task(solana_websocket_listener())
+    monitor_task = asyncio.create_task(monitor_tokens())
     yield
-    bot_task.cancel()
-    try:
-        await bot_task
-    except asyncio.CancelledError:
-        pass
+    ws_task.cancel()
+    monitor_task.cancel()
+    for task in [ws_task, monitor_task]:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -173,10 +180,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
+    active = sum(1 for t in tracked_new_tokens.values() if not t["alerted"])
     return {
         "status": "active",
         "sol_price": SOL_PRICE_USD,
-        "target_mcap_sol": TARGET_MCAP_SOL,
-        "target_mcap_usd": TARGET_MCAP_SOL * SOL_PRICE_USD,
-        "tracked_tokens": len(tracked_new_tokens)
+        "target_mcap_usd": TARGET_MCAP_USD,
+        "tracked_tokens": len(tracked_new_tokens),
+        "active_tokens": active
     }

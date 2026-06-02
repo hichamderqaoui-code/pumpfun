@@ -1,36 +1,61 @@
 import asyncio
+import os
+import httpx  # Assure-toi d'avoir 'httpx' dans ton requirements.txt
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
-# 1. Définir la fonction de ton bot qui tourne en boucle
+# Récupération des identifiants (à configurer dans l'onglet Variables de Railway)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "TON_TOKEN_BOT")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "TON_CHAT_ID")
+
+# Fonction asynchrone pour envoyer les alertes
+async def send_telegram_alert(message: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload)
+            if response.status_code != 200:
+                print(f"[TELEGRAM] ❌ Erreur API: {response.status_code} - {response.text}")
+            else:
+                print("[TELEGRAM] ✅ Message envoyé avec succès !")
+    except Exception as e:
+        print(f"[TELEGRAM] ❌ Erreur de connexion : {e}")
+
+# Boucle principale de ton monitoring Solana
 async def run_solana_monitor():
     print("=== [BOT] Initialisation du monitoring Solana ===")
-    # Insère ici la logique de ton bot (écoute des paires, filtres liquidité/volume, etc.)
+    
+    # ─── TEST D'ENVOI AU DÉMARRAGE ───
+    print("[BOT] Envoi du message de test à Telegram...")
+    await send_telegram_alert("🚀 *Le bot Solana est en ligne sur Railway !* \nLes alertes de tokens vont commencer.")
+    # ─────────────────────────────────
+
     while True:
         try:
-            # Exemple de boucle d'écoute
-            # print("[BOT] Recherche de nouveaux tokens sur Pump.fun...")
-            await asyncio.sleep(1) # Ne pas supprimer pour éviter de saturer le CPU
+            # Insère ici ta logique de détection (Pump.fun / Axiom)
+            # Exemple quand un token valide tes critères :
+            # await send_telegram_alert(f"💎 *Nouveau Token Détecté !*\nAdresse: {token_address}")
+            
+            await asyncio.sleep(1)
         except asyncio.CancelledError:
             print("=== [BOT] Arrêt du monitoring ===")
             break
         except Exception as e:
             print(f"[BOT] Erreur rencontrée : {e}")
-            await asyncio.sleep(5) # Pause avant reconnexon en cas de crash
+            await asyncio.sleep(5)
 
-# 2. Configurer le gestionnaire de cycle de vie (lifespan)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Tout ce qui est écrit ici s'exécute au DÉMARRAGE du conteneur
     bot_task = asyncio.create_task(run_solana_monitor())
-    
-    yield  # Le serveur Uvicorn tourne pendant ce temps
-    
-    # Tout ce qui est écrit ici s'exécute à l'ARRÊT du conteneur
+    yield
     bot_task.cancel()
     await bot_task
 
-# 3. Initialiser FastAPI avec le lifespan
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")

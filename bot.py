@@ -11,13 +11,13 @@ import time
 # ─── CONFIG ───
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
-TARGET_MCAP_USD   = float(os.getenv("TARGET_MCAP_USD",  "10000"))
-MAX_AGE_SECONDS   = int(os.getenv("MAX_AGE_SECONDS",    "600"))
+TARGET_MCAP_USD   = float(os.getenv("TARGET_MCAP_USD",  "2000"))
+MAX_AGE_SECONDS   = int(os.getenv("MAX_AGE_SECONDS",    "1200"))
 SOL_PRICE_USD     = float(os.getenv("SOL_PRICE_USD",    "75.33"))
-MIN_VOLUME_USD    = float(os.getenv("MIN_VOLUME_USD",   "3000"))
-MIN_TXS_5MIN      = int(os.getenv("MIN_TXS_5MIN",       "20"))
-MIN_AGE_SECONDS   = int(os.getenv("MIN_AGE_SECONDS",    "120"))
-MIN_HOLDERS       = int(os.getenv("MIN_HOLDERS",         "30"))
+MIN_VOLUME_USD    = float(os.getenv("MIN_VOLUME_USD",   "50"))
+MIN_TXS_5MIN      = int(os.getenv("MIN_TXS_5MIN",       "1"))
+MIN_AGE_SECONDS   = int(os.getenv("MIN_AGE_SECONDS",    "30"))
+MIN_HOLDERS       = int(os.getenv("MIN_HOLDERS",         "3"))
 POLL_INTERVAL     = 15
 
 tracked_new_tokens = OrderedDict()
@@ -43,6 +43,11 @@ def register_new_token(data: dict):
 async def send_telegram_alert(message: str, is_test: bool = False):
     token   = str(TELEGRAM_TOKEN).strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
+
+    if not token or not chat_id:
+        print(f"[TELEGRAM] ❌ MANQUANT → token='{token[:15]}' chat_id='{chat_id}'")
+        return
+
     url     = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
     if not is_test:
@@ -60,7 +65,6 @@ async def send_telegram_alert(message: str, is_test: bool = False):
 
 
 async def check_token_pumpfun(mint: str) -> dict:
-    """Données natives Pump.fun — fiables pré-migration bonding curve"""
     try:
         url = f"https://frontend-api.pump.fun/coins/{mint}"
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -78,16 +82,11 @@ async def check_token_pumpfun(mint: str) -> dict:
             mcap_usd    = float(d.get("usd_market_cap") or 0)
             holders     = int(d.get("holder_count") or 0)
             reply_count = int(d.get("reply_count") or 0)
-            complete    = bool(d.get("complete", False))  # True = déjà migré
+            complete    = bool(d.get("complete", False))
 
-            # Bonding curve progress (0-100%)
-            vsol = float(d.get("virtual_sol_reserves") or 0)
-            vtok = float(d.get("virtual_token_reserves") or 0)
-            # Progress estimé : MC / 69K SOL en USD
-            migration_target_usd = 69 * SOL_PRICE_USD * 1000  # ~69K SOL
+            migration_target_usd = 69 * SOL_PRICE_USD * 1000
             bonding_pct = min((mcap_usd / migration_target_usd) * 100, 100) if migration_target_usd > 0 else 0
 
-            # Volume & trades depuis pumpportal (king_of_the_hill = très actif)
             king = bool(d.get("is_currently_live") or d.get("king_of_the_hill_timestamp"))
 
             return {
@@ -107,7 +106,6 @@ async def check_token_pumpfun(mint: str) -> dict:
 
 
 async def check_token_trades(mint: str) -> dict:
-    """Volume et nb de trades récents via pumpportal trades API"""
     try:
         url = f"https://frontend-api.pump.fun/trades/all/{mint}?limit=50&offset=0&minimumSize=0"
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -118,31 +116,34 @@ async def check_token_trades(mint: str) -> dict:
             if not isinstance(trades, list):
                 return {"volume_usd": 0, "txs_recent": 0, "buys": 0, "sells": 0}
 
-            now = time.time() * 1000  # ms
+            now          = time.time() * 1000
             five_min_ago = now - (5 * 60 * 1000)
 
+            volume_5min = 0.0
             volume_usd  = 0.0
             txs_recent  = 0
             buys        = 0
             sells       = 0
 
             for t in trades:
-                ts = t.get("timestamp", 0)
+                ts         = t.get("timestamp", 0)
                 sol_amount = float(t.get("sol_amount") or 0) / 1e9
                 usd_val    = sol_amount * SOL_PRICE_USD
                 volume_usd += usd_val
                 if ts >= five_min_ago:
                     txs_recent += 1
+                    volume_5min += usd_val
                     if t.get("is_buy"):
                         buys += 1
                     else:
                         sells += 1
 
             return {
-                "volume_usd":  volume_usd,
-                "txs_recent":  txs_recent,
-                "buys":        buys,
-                "sells":       sells,
+                "volume_usd":   volume_5min,   # ✅ volume sur 5 min uniquement
+                "volume_total": volume_usd,
+                "txs_recent":   txs_recent,
+                "buys":         buys,
+                "sells":        sells,
             }
     except Exception as e:
         print(f"[TRADES] ❌ {mint[:8]} : {e}")
@@ -153,32 +154,27 @@ def calculer_score(p: dict, t: dict, elapsed: float) -> tuple:
     score  = 0
     points = []
 
-    # Market cap (max 20 pts)
     mc = p["mcap_usd"]
     if mc >= 50000:   score += 20; points.append("💰 MC fort (50K$+)")
     elif mc >= 30000: score += 14; points.append("💰 MC solide (30K$+)")
     elif mc >= 10000: score += 8
 
-    # Holders (max 20 pts) — données natives fiables
     h = p["holders"]
     if h >= 200:   score += 20; points.append("👥 Holders solides (200+)")
     elif h >= 100: score += 14; points.append("👥 Bons holders (100+)")
     elif h >= 50:  score += 10; points.append("👥 Holders corrects (50+)")
     elif h >= 30:  score += 5
 
-    # Volume récent (max 20 pts)
     v = t["volume_usd"]
     if v >= 20000:  score += 20; points.append("📊 Volume explosif (20K$+)")
     elif v >= 8000: score += 14; points.append("📊 Volume fort (8K$+)")
     elif v >= 3000: score += 8
 
-    # Transactions 5 min (max 20 pts)
     tx = t["txs_recent"]
     if tx >= 100:  score += 20; points.append("⚡ Activité explosive (100+ tx/5min)")
     elif tx >= 50: score += 14; points.append("⚡ Forte activité (50+ tx/5min)")
     elif tx >= 20: score += 8
 
-    # Buy pressure (max 10 pts)
     total_tx = t["buys"] + t["sells"]
     if total_tx > 0:
         buy_ratio = t["buys"] / total_tx
@@ -186,17 +182,14 @@ def calculer_score(p: dict, t: dict, elapsed: float) -> tuple:
         elif buy_ratio >= 0.60: score += 6;  points.append("🟢 Majorité acheteurs (60%+)")
         elif buy_ratio >= 0.50: score += 3
 
-    # Bonding curve (max 10 pts) — entre 10% et 80% = zone idéale
     bp = p["bonding_pct"]
     if 10 <= bp <= 50:   score += 10; points.append(f"📉 Bonding curve idéale ({bp:.0f}%)")
     elif 50 < bp <= 80:  score += 6;  points.append(f"📉 Bonding curve avancée ({bp:.0f}%)")
     elif bp > 80:        score += 2;  points.append(f"⚠️ Proche migration ({bp:.0f}%)")
 
-    # Communauté active (max 5 pts)
     if p["reply_count"] >= 20:  score += 5; points.append("💬 Communauté active")
     elif p["reply_count"] >= 5: score += 2
 
-    # Timing (bonus 5 pts)
     mins = elapsed / 60
     if 2 <= mins <= 5:  score += 5; points.append(f"⏱️ Timing parfait ({mins:.0f} min)")
     elif mins <= 8:     score += 2
@@ -232,13 +225,12 @@ async def monitor_tokens():
                 continue
 
             checked += 1
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)  # ✅ laisse la main à asyncio
 
             p = await check_token_pumpfun(mint)
             if not p:
                 continue
 
-            # Token déjà migré → trop tard
             if p["complete"]:
                 token_info["alerted"] = True
                 print(f"[SKIP] {token_info['name']} déjà migré sur Raydium")
@@ -246,14 +238,14 @@ async def monitor_tokens():
 
             t = await check_token_trades(mint)
 
-            mcap_usd   = p["mcap_usd"]
-            holders    = p["holders"]
-            volume     = t["volume_usd"]
-            txs        = t["txs_recent"]
-            buys       = t["buys"]
-            sells      = t["sells"]
-            bonding    = p["bonding_pct"]
-            replies    = p["reply_count"]
+            mcap_usd = p["mcap_usd"]
+            holders  = p["holders"]
+            volume   = t["volume_usd"]
+            txs      = t["txs_recent"]
+            buys     = t["buys"]
+            sells    = t["sells"]
+            bonding  = p["bonding_pct"]
+            replies  = p["reply_count"]
 
             print(
                 f"[POLL] {token_info['name'][:16]:<16} | "
@@ -266,11 +258,10 @@ async def monitor_tokens():
                 f"{elapsed:.0f}s"
             )
 
-            # ── MC minimum ──
             if mcap_usd < TARGET_MCAP_USD:
+                print(f"[FILTRE] ❌ {token_info['name']} → MC {mcap_usd:,.0f}$<{TARGET_MCAP_USD:,.0f}$")
                 continue
 
-            # ── Filtres ──
             reasons = []
             if holders < MIN_HOLDERS:    reasons.append(f"holders {holders}<{MIN_HOLDERS}")
             if volume  < MIN_VOLUME_USD: reasons.append(f"vol {volume:,.0f}$<{MIN_VOLUME_USD:,.0f}$")
@@ -283,7 +274,6 @@ async def monitor_tokens():
                 print(f"[FILTRE] ❌ {token_info['name']} → {' | '.join(reasons)}")
                 continue
 
-            # ── Score ──
             score, points = calculer_score(p, t, elapsed)
             token_info["alerted"] = True
 
@@ -294,7 +284,7 @@ async def monitor_tokens():
             time_str = f"{mins_e}m {secs_e}s" if mins_e > 0 else f"{secs_e}s"
             mult     = 100000 / mcap_usd if mcap_usd > 0 else 10
             em       = emoji_score(score)
-            pts_str  = "\n".join(f"  {p}" for p in points) if points else "  —"
+            pts_str  = "\n".join(f"  {pt}" for pt in points) if points else "  —"
 
             print(f"🎯 [ALERTE] {name} | Score:{score}/100 | MC:{mcap_usd:,.0f}$ | H:{holders} | BC:{bonding:.0f}% | {time_str}")
 
@@ -355,6 +345,7 @@ async def solana_websocket_listener():
                         continue
                     if data.get("txType") == "create":
                         register_new_token(data)
+                    await asyncio.sleep(0)  # ✅ FIX CRITIQUE : cède la main au monitor
 
         except websockets.exceptions.ConnectionClosed:
             print("[WEBSOCKET] ❌ Reconnexion dans 3s...")
@@ -395,3 +386,19 @@ def home():
         "tracked_tokens":  len(tracked_new_tokens),
         "active_tokens":   active
     }
+
+
+@app.get("/test-telegram")
+async def test_telegram():
+    token   = str(TELEGRAM_TOKEN).strip()
+    chat_id = str(TELEGRAM_CHAT_ID).strip()
+    url     = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json={
+                "chat_id": chat_id,
+                "text": "✅ TEST BOT OK"
+            }, timeout=10.0)
+            return {"status": r.status_code, "response": r.json(), "token_preview": token[:15]+"...", "chat_id": chat_id}
+    except Exception as e:
+        return {"error": str(e)}

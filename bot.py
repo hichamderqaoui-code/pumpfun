@@ -13,7 +13,7 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Ajustement automatique au marché (SOL configuré sur Railway)
-SOL_PRICE_USD     = float(os.getenv("SOL_PRICE_USD", "65.00"))  
+SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
 MIGRATION_MCAP    = float(os.getenv("MIGRATION_USD", "27000.0"))  # Seuil de migration Raydium
 
 # Zone d'entrée cible configurée via Railway (ex: 12000)
@@ -27,6 +27,15 @@ MAX_AGE_SECONDS    = int(os.getenv("MAX_AGE_SECONDS", "600"))    # Fenêtre max 
 
 tracked_tokens = OrderedDict()
 MAX_TRACKED = 1000
+
+def safe_float(value, default=0.0) -> float:
+    """Sécurise la conversion en float pour éviter les crashs sur payloads corrompus"""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
 def register_new_token(data: dict):
     mint = data.get("mint")
@@ -72,8 +81,16 @@ async def send_telegram_alert(message: str, is_test: bool = False):
 
 def analyser_trade_streaming(data: dict):
     mint = data.get("mint")
-    if not mint or mint not in tracked_tokens:
+    if not mint:
         return
+
+    # Auto-apprentissage : Si le trade arrive avant le message de création, on l'enregistre à la volée
+    if mint not in tracked_tokens:
+        register_new_token({
+            "mint": mint,
+            "name": data.get("name", "Unknown Jeton"),
+            "symbol": data.get("symbol", "TOKEN")
+        })
 
     token_info = tracked_tokens[mint]
     if token_info["alerted"]:
@@ -86,10 +103,9 @@ def analyser_trade_streaming(data: dict):
         token_info["alerted"] = True
         return
 
-    # Extraction des données du trade
+    # Extraction sécurisée des données numériques pour éviter les crashs
     trader = data.get("traderPublicKey")
-    sol_amount = float(data.get("solAmount", 0)) / 1e9  
-    v_sol = float(data.get("vSolReserves", 0)) / 1e9
+    sol_amount = safe_float(data.get("solAmount")) / 1e9  
     
     if trader:
         token_info["traders"].add(trader)
@@ -97,16 +113,19 @@ def analyser_trade_streaming(data: dict):
     token_info["tx_count"] += 1
     token_info["volume_usd"] += (sol_amount * SOL_PRICE_USD)
 
-    if data.get("txType") == "buy":
+    tx_type = data.get("txType")
+    if tx_type == "buy":
         token_info["buys"] += 1
-    elif data.get("txType") == "sell":
+    elif tx_type == "sell":
         token_info["sells"] += 1
 
-    # Calcul du Market Cap exact
-    mcap_usd = v_sol * SOL_PRICE_USD if v_sol > 0 else (float(data.get("marketCapSol", 0)) * SOL_PRICE_USD)
+    # Calcul fiable basé sur le marketCapSol natif de l'API de PumpPortal
+    mcap_sol_brut = safe_float(data.get("marketCapSol"))
+    mcap_usd = mcap_sol_brut * SOL_PRICE_USD
+    
     unique_holders = len(token_info["traders"])
 
-    # Log discret de streaming d'activité
+    # Log discret de streaming d'activité toutes les 5 transactions
     if token_info["tx_count"] % 5 == 0:
         print(f"⚡ [STREAM] {token_info['name'][:12]:<12} | MC: {mcap_usd:,.0f}$ | Traders: {unique_holders}")
 
@@ -127,7 +146,7 @@ def analyser_trade_streaming(data: dict):
             symbol = token_info["symbol"]
             progress_migration = (mcap_usd / MIGRATION_MCAP) * 100
             time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-            potential_x = 100000.0 / mcap_usd
+            potential_x = 100000.0 / mcap_usd if mcap_usd > 0 else 0
 
             print(f"🔥 [ALERTE] {name} validé ! Envoi Telegram...")
 
@@ -154,7 +173,7 @@ async def solana_websocket_listener():
     uri = "wss://pumpportal.fun/api/data"
     print("=== [BOT] Initialisation du Sniper Streaming WebSocket ===")
     
-    # Message test envoyé immédiatement au lancement pour valider tes identifiants Telegram
+    # Message test envoyé au lancement
     await send_telegram_alert("⚡ *Sniper Streaming Actif* — Mode Surveillance global en cours...", is_test=True)
 
     while True:
@@ -170,11 +189,19 @@ async def solana_websocket_listener():
                     except json.JSONDecodeError:
                         continue
                     
+                    # Détection robuste selon les clés présentes dans le dictionnaire
+                    # PumpPortal marque l'action de création par la clé "arguments" ou la méthode, ou l'absence de txType traditionnel
                     tx_type = data.get("txType")
-                    if tx_type == "create" or data.get("eventType") == "create":
-                        register_new_token(data)
+                    event_type = data.get("eventType")
+                    
+                    if tx_type == "create" or event_type == "create" or "message" in data:
+                        # Si c'est un message système ou de création pure
+                        if data.get("mint"):
+                            register_new_token(data)
                     else:
-                        analyser_trade_streaming(data)
+                        # Par défaut, si on reçoit un flux d'activité de transaction
+                        if tx_type in ["buy", "sell"]:
+                            analyser_trade_streaming(data)
 
         except websockets.exceptions.ConnectionClosed:
             print("[WEBSOCKET] Connexion perdue, reconnexion dans 3s...")

@@ -124,15 +124,12 @@ def analyser_trade_streaming(data: dict):
             f"{elapsed:.0f}s"
         )
 
-    # Pas encore au seuil
     if mcap_usd < TARGET_MCAP_USD:
         return
 
-    # Anti wash-trading
     if unique_holders < MIN_HOLDERS:
         return
 
-    # Déjà migré → trop tard
     if mcap_usd >= MIGRATION_USD:
         token_info["alerted"] = True
         print(f"[SKIP] {token_info['name']} déjà migré ({mcap_usd:,.0f}$)")
@@ -140,9 +137,9 @@ def analyser_trade_streaming(data: dict):
 
     token_info["alerted"] = True
 
-    name     = token_info["name"]
-    symbol   = token_info["symbol"]
-    time_str = f"{int(elapsed//60)}m {int(elapsed%60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+    name      = token_info["name"]
+    symbol    = token_info["symbol"]
+    time_str  = f"{int(elapsed//60)}m {int(elapsed%60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
     mult_mig  = MIGRATION_USD / mcap_usd
     mult_100k = 100000 / mcap_usd
     reste_pct = 100 - bc_pct

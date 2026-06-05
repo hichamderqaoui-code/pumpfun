@@ -12,7 +12,6 @@ import time
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
-HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 
 # 🎯 CONFIGURATION STRATÉGIE EXPLOSION (STRETCH)
 MIN_STRETCH_MCAP   = 8000.0   
@@ -66,18 +65,15 @@ def analyser_logs_solana(params: dict):
     value = result.get("value", {})
     logs = value.get("logs", [])
     
-    # On cherche si la transaction implique le programme Pump.fun
     is_pump_transaction = False
     for log in logs:
-        if "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz" in log or "Program log: Instruction:" in log:
+        if "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz" in log:
             is_pump_transaction = True
             break
             
     if not is_pump_transaction:
         return
 
-    # Extraction des changements de jetons pour identifier le mint
-    # On se base sur une structure simplifiée de transaction validée
     tx = value.get("transaction", {})
     meta = tx.get("meta", {}) if tx else {}
     if not meta:
@@ -105,7 +101,6 @@ def analyser_logs_solana(params: dict):
         return
 
     if ui_amount > 0:
-        # Estimation du Market Cap basé sur les tokens restants dans la courbe
         mcap_sol = (1000000000 - ui_amount) * 0.00000003 + 30 
         mcap_usd = mcap_sol * SOL_PRICE_USD
 
@@ -117,7 +112,7 @@ def analyser_logs_solana(params: dict):
             print(f"🔥 [EXPLOSION DETECTED] Token {mint} à {mcap_usd:,.0f}$")
 
             message = (
-                f"⚡ <b>NOUVELLE PAIRE EN EXPLOSION (RPC)</b> ⚡\n\n"
+                f"⚡ <b>NOUVELLE PAIRE EN EXPLOSION (SOLANA RPC)</b> ⚡\n\n"
                 f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
                 f"• <b>Âge de la paire :</b> <code>{time_str}</code> 🔥\n\n"
                 f"📊 <b>Outils de Sniping :</b>\n"
@@ -129,21 +124,17 @@ def analyser_logs_solana(params: dict):
 
 async def solana_websocket_listener():
     global TOTAL_MESSAGES_RECEIVED
-    if not HELIUS_API_KEY.strip():
-        print("[ERREUR] La variable HELIUS_API_KEY n'est pas configurée dans Railway !")
-        return
-
-    # L'adresse WebSocket correcte et standard d'Helius
-    uri = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    print("=== [BOT] Connexion WebSocket RPC Helius ===")
+    
+    # 📡 Utilisation du WebSocket Public de la Communauté Solana (Sans clé / Sans limite 429)
+    uri = "wss://api.mainnet-beta.solana.com"
+    print("=== [BOT] Connexion au WebSocket Public Solana ===")
     
     await asyncio.sleep(2)
-    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper RPC Helius Connecté</b> — Scan des nouvelles paires explosives en cours..."))
+    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper Public Connecté</b> — Scan de la zone Stretch réinitialisé..."))
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                # Abonnement aux logs du programme de Pump.fun
                 subscribe_payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -154,7 +145,7 @@ async def solana_websocket_listener():
                     ]
                 }
                 await websocket.send(json.dumps(subscribe_payload))
-                print("[HELIUS RPC] 📡 Flux WebSocket raccordé à Solana.")
+                print("[SOLANA RPC] 📡 Flux public raccordé avec succès.")
 
                 async for message in websocket:
                     TOTAL_MESSAGES_RECEIVED += 1
@@ -170,8 +161,8 @@ async def solana_websocket_listener():
                         continue
 
         except Exception as e:
-            print(f"[RPC RETRY] Déconnexion ({e}), tentative dans 3s...")
-            await asyncio.sleep(3)
+            print(f"[RPC RETRY] Erreur réseau ({e}), reconnexion dans 5s...")
+            await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

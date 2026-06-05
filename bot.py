@@ -12,6 +12,7 @@ import time
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
+SHYFT_API_KEY      = os.getenv("SHYFT_API_KEY", "").strip()
 
 # 🎯 CONFIGURATION STRATÉGIE EXPLOSION (STRETCH)
 MIN_STRETCH_MCAP   = 8000.0   
@@ -60,61 +61,49 @@ async def send_telegram_alert(message: str):
     except Exception as e:
         print(f"[TELEGRAM ERREUR] -> {e}")
 
-def analyser_logs_solana(params: dict):
-    result = params.get("result", {})
-    value = result.get("value", {})
-    logs = value.get("logs", [])
-    
-    is_pump_transaction = False
-    for log in logs:
-        if "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz" in log:
-            is_pump_transaction = True
-            break
-            
-    if not is_pump_transaction:
+def analyser_donnees_shyft(data: dict):
+    # Traitement des messages du flux filtré Shyft
+    actions = data.get("actions", [])
+    if not actions:
         return
 
-    tx = value.get("transaction", {})
-    meta = tx.get("meta", {}) if tx else {}
-    if not meta:
-        return
+    for action in actions:
+        # On cible uniquement les transactions liées à Pump.fun
+        info = action.get("info", {})
+        mint = info.get("mint") or info.get("token_address")
         
-    post_balances = meta.get("postTokenBalances", [])
-    mint = None
-    ui_amount = 0.0
-    
-    for balance in post_balances:
-        if balance.get("owner") == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz":
-            mint = balance.get("mint")
-            ui_amount = safe_float(balance.get("uiTokenAmount", {}).get("uiAmount"))
-            break
+        if not mint:
+            continue
 
-    if not mint:
-        return
+        now = time.time()
+        if mint not in tracked_tokens:
+            register_new_token(mint)
 
-    now = time.time()
-    if mint not in tracked_tokens:
-        register_new_token(mint)
+        token_info = tracked_tokens[mint]
+        if token_info["alerted"] or (now - token_info["created_at"]) > MAX_TOKEN_AGE_SEC:
+            continue
 
-    token_info = tracked_tokens[mint]
-    if token_info["alerted"] or (now - token_info["created_at"]) > MAX_TOKEN_AGE_SEC:
-        return
-
-    if ui_amount > 0:
-        mcap_sol = (1000000000 - ui_amount) * 0.00000003 + 30 
-        mcap_usd = mcap_sol * SOL_PRICE_USD
+        # Extraction ou estimation des volumes/mcap
+        mcap_usd = safe_float(info.get("market_cap_usd") or info.get("mcap"))
+        
+        # Si Shyft ne donne pas le mcap direct, on regarde les SOL de la transaction pour estimer la courbe
+        if mcap_usd == 0.0 and "tokens_swapped" in info:
+            swapped = safe_float(info.get("tokens_swapped"))
+            if swapped > 0:
+                mcap_sol = (1000000000 - swapped) * 0.00000003 + 30
+                mcap_usd = mcap_sol * SOL_PRICE_USD
 
         if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
             token_info["alerted"] = True
             elapsed = now - token_info["created_at"]
             time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-            print(f"🔥 [EXPLOSION DETECTED] Token {mint} à {mcap_usd:,.0f}$")
+            print(f"🔥 [SHYFT EXPLOSION] Token {mint} à {mcap_usd:,.0f}$")
 
             message = (
-                f"⚡ <b>NOUVELLE PAIRE EN EXPLOSION (SOLANA RPC)</b> ⚡\n\n"
+                f"⚡ <b>PAIRE EN EXPLOSION (SHYFT STREAM)</b> ⚡\n\n"
                 f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-                f"• <b>Âge de la paire :</b> <code>{time_str}</code> 🔥\n\n"
+                f"• <b>Âge du Jeton :</b> <code>{time_str}</code> 🔥\n\n"
                 f"📊 <b>Outils de Sniping :</b>\n"
                 f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
                 f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
@@ -125,44 +114,48 @@ def analyser_logs_solana(params: dict):
 async def solana_websocket_listener():
     global TOTAL_MESSAGES_RECEIVED
     
-    # 📡 Utilisation du WebSocket Public de la Communauté Solana (Sans clé / Sans limite 429)
-    uri = "wss://api.mainnet-beta.solana.com"
-    print("=== [BOT] Connexion au WebSocket Public Solana ===")
+    if not SHYFT_API_KEY:
+        print("[ERREUR] La variable SHYFT_API_KEY n'est pas configurée dans Railway !")
+        return
+
+    # Connexion directe à l'infrastructure gRPC/WebSocket optimisée de Shyft
+    uri = f"wss://api.shyft.to/sol/v1/streaming?api_key={SHYFT_API_KEY}"
+    print("=== [BOT] Connexion au WebSocket Dédié Shyft ===")
     
     await asyncio.sleep(2)
-    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper Public Connecté</b> — Scan de la zone Stretch réinitialisé..."))
+    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper SHYFT Connecté</b> — Démarrage du flux de détection..."))
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
+                # Demande d'abonnement spécifique pour Pump.fun (évite le spam global)
                 subscribe_payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [
-                        {"mentions": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz"]},
-                        {"commitment": "confirmed"}
-                    ]
+                    "method": "SUBSCRIBE",
+                    "params": {
+                        "accounts": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz"],
+                        "type": "transactions"
+                    },
+                    "id": 1
                 }
                 await websocket.send(json.dumps(subscribe_payload))
-                print("[SOLANA RPC] 📡 Flux public raccordé avec succès.")
+                print("[SHYFT] 📡 Flux de transaction ciblé et connecté.")
 
                 async for message in websocket:
                     TOTAL_MESSAGES_RECEIVED += 1
                     if TOTAL_MESSAGES_RECEIVED % 50 == 0:
-                        print(f"[RPC CHECK] {TOTAL_MESSAGES_RECEIVED} logs réseau analysés...")
+                        print(f"[SHYFT CHECK] {TOTAL_MESSAGES_RECEIVED} transactions analysées...")
 
                     try:
                         data = json.loads(message)
-                        params = data.get("params")
-                        if params:
-                            analyser_logs_solana(params)
+                        # Vérification de la présence de données de transaction
+                        if "actions" in data:
+                            analyser_donnees_shyft(data)
                     except Exception:
                         continue
 
         except Exception as e:
-            print(f"[RPC RETRY] Erreur réseau ({e}), reconnexion dans 5s...")
-            await asyncio.sleep(5)
+            print(f"[SHYFT RETRY] Déconnexion ({e}), reconnexion dans 4s...")
+            await asyncio.sleep(4)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

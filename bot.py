@@ -17,6 +17,9 @@ SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))
 MIN_STRETCH_MCAP   = 8000.0   # Début de la zone Stretch
 MAX_STRETCH_MCAP   = 15000.0  # Fin de la zone d'alerte Stretch
 
+# ─── COMPTEUR DE VÉRIFICATION EN DIRECT ───
+TOTAL_TRADES_ANALYSED = 0
+
 tracked_tokens = OrderedDict()
 MAX_TRACKED = 2000  
 
@@ -67,9 +70,15 @@ async def send_telegram_alert(message: str, is_test: bool = False):
         print(f"[TELEGRAM ERREUR] -> {e}")
 
 def analyser_trade_streaming(data: dict):
+    global TOTAL_TRADES_ANALYSED
     mint = data.get("mint")
     if not mint:
         return
+
+    # 📈 COMPTEUR LIVE : Affiche l'activité en tâche de fond toutes les 500 transactions reçues
+    TOTAL_TRADES_ANALYSED += 1
+    if TOTAL_TRADES_ANALYSED % 500 == 0:
+        print(f"[LIVE CHECK] Bot actif. {TOTAL_TRADES_ANALYSED} transactions analysées en tâche de fond...")
 
     if mint not in tracked_tokens:
         register_new_token({
@@ -86,7 +95,7 @@ def analyser_trade_streaming(data: dict):
     mcap_sol_brut = safe_float(data.get("marketCapSol"))
     mcap_usd = mcap_sol_brut * SOL_PRICE_USD
 
-    # 🎯 FILTRE DE LA COLONNE STRETCH
+    # 🎯 FILTRE DE LA COLONNE STRETCH (8k$ - 15k$)
     if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
         token_info["alerted"] = True  
         
@@ -96,7 +105,7 @@ def analyser_trade_streaming(data: dict):
         elapsed = now - token_info["created_at"]
         time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-        print(f"📈 [STRETCH DETECTED] {name} entre dans la zone Stretch ({mcap_usd:,.0f}$) ! Alerte Telegram...")
+        print(f"🔥 [STRETCH DETECTED] {name} entre dans la zone Stretch ({mcap_usd:,.0f}$) ! Alerte Telegram...")
 
         message = (
             f"📈 <b>ZONING STRETCH (AXIOM MODE)</b> 📈\n\n"
@@ -117,7 +126,7 @@ async def solana_websocket_listener():
     print("=== [BOT] Initialisation du Sniper Mode STRETCH ===")
     
     await asyncio.sleep(2)
-    asyncio.create_task(send_telegram_alert("📡 <b>Mode Stretch Axiom Actif</b> — Surveillance de la zone 8k$-15k$ en cours...", is_test=True))
+    asyncio.create_task(send_telegram_alert("📡 <b>Mode Stretch Axiom Actif</b> — Surveillance de la zone 8k$-15k$ avec indicateur d'activité...", is_test=True))
 
     while True:
         try:
@@ -166,5 +175,6 @@ def health_check():
     return {
         "status": "online",
         "mode": "Alerte entrée colonne Stretch (8k$-15k$)",
-        "tracked_tokens_count": len(tracked_tokens)
+        "tracked_tokens_count": len(tracked_tokens),
+        "total_trades_processed": TOTAL_TRADES_ANALYSED
     }

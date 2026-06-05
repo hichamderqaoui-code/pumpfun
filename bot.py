@@ -12,18 +12,18 @@ import time
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Ajustement automatique au marché bas (SOL à 65$)
+# Ajustement automatique au marché (SOL configuré sur Railway)
 SOL_PRICE_USD     = float(os.getenv("SOL_PRICE_USD", "65.00"))  
-MIGRATION_MCAP    = 27000.0  # Seuil de migration Raydium à 65$ / SOL
+MIGRATION_MCAP    = float(os.getenv("MIGRATION_USD", "27000.0"))  # Seuil de migration Raydium
 
-# Zone d'entrée cible (Autour de 10k$)
+# Zone d'entrée cible configurée via Railway (ex: 12000)
+MAX_TRACK_MCAP    = float(os.getenv("TARGET_MCAP_USD", "12000.0"))  
 MIN_TRACK_MCAP    = 7000.0   
-MAX_TRACK_MCAP    = 15000.0  
 
 # Filtres de qualité anti-spam
-MIN_UNIQUE_TRADERS = 8       # Élimine les Devs qui wash-tradent en solo
+MIN_UNIQUE_TRADERS = int(os.getenv("MIN_HOLDERS", "5"))     # Sécurité traders uniques
 MIN_TX_COUNT       = 15      # Minimum d'activité sur la curve
-MAX_AGE_SECONDS    = 900     # Le token doit avoir moins de 15 minutes
+MAX_AGE_SECONDS    = int(os.getenv("MAX_AGE_SECONDS", "600"))    # Fenêtre max (ex: 10 minutes)
 
 tracked_tokens = OrderedDict()
 MAX_TRACKED = 1000
@@ -47,8 +47,9 @@ def register_new_token(data: dict):
         "buys": 0,
         "sells": 0
     }
+    print(f"🆕 [WS CREATION] {data.get('name')} enregistré ({mint[:8]}...)")
 
-async def send_telegram_alert(message: str):
+async def send_telegram_alert(message: str, is_test: bool = False):
     token = str(TELEGRAM_TOKEN).strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     if not token or not chat_id:
@@ -57,10 +58,12 @@ async def send_telegram_alert(message: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id, 
-        "text": message, 
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
+        "text": message
     }
+    if not is_test:
+        payload["parse_mode"] = "Markdown"
+        payload["disable_web_page_preview"] = True
+        
     try:
         async with httpx.AsyncClient() as client:
             await client.post(url, json=payload, timeout=5.0)
@@ -99,18 +102,22 @@ def analyser_trade_streaming(data: dict):
     elif data.get("txType") == "sell":
         token_info["sells"] += 1
 
-    # Calcul du Market Cap exact basé sur les réserves virtuelles en SOL
+    # Calcul du Market Cap exact
     mcap_usd = v_sol * SOL_PRICE_USD if v_sol > 0 else (float(data.get("marketCapSol", 0)) * SOL_PRICE_USD)
     unique_holders = len(token_info["traders"])
 
-    # 🎯 FILTRAGE LOGIQUE POUR SÉLECTIONNER UNIQUEMENT LES MEILLEURES PIÈCES
+    # Log discret de streaming d'activité
+    if token_info["tx_count"] % 5 == 0:
+        print(f"⚡ [STREAM] {token_info['name'][:12]:<12} | MC: {mcap_usd:,.0f}$ | Traders: {unique_holders}")
+
+    # 🎯 VALIDATION DE LA STRATÉGIE ET DES FILTRES
     if MIN_TRACK_MCAP <= mcap_usd <= MAX_TRACK_MCAP:
         if unique_holders >= MIN_UNIQUE_TRADERS and token_info["tx_count"] >= MIN_TX_COUNT:
             
             total_tx = token_info["buys"] + token_info["sells"]
             buy_ratio = token_info["buys"] / total_tx if total_tx > 0 else 0
             
-            # On exige au moins 65% de pression acheteuse
+            # Exigence de 65% de pression acheteuse pour éviter les rug/dumps rapides
             if buy_ratio < 0.65:
                 return
 
@@ -120,22 +127,20 @@ def analyser_trade_streaming(data: dict):
             symbol = token_info["symbol"]
             progress_migration = (mcap_usd / MIGRATION_MCAP) * 100
             time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-            
-            # Calcul du multiplicateur pour atteindre ton objectif de 100k$
             potential_x = 100000.0 / mcap_usd
 
-            print(f"🔥 [SIGNAL] {name} validé ! MC: {mcap_usd:,.0f}$")
+            print(f"🔥 [ALERTE] {name} validé ! Envoi Telegram...")
 
             message = (
-                f"🚀 *PÉPITE DÉTECTÉE (CIBLE ~10K)* 🚀\n\n"
+                f"🚀 *PÉPITE DÉTECTÉE (CIBLE PRÉ-MIGRATION)* 🚀\n\n"
                 f"• *Nom :* {name} ({symbol})\n"
                 f"• *Market Cap Actuel :* `{mcap_usd:,.0f}$` 💰\n"
-                f"• *Avancement Raydium :* `{progress_migration:.1f}%` (Cible: {MIGRATION_MCAP:,.0f}$)\n"
+                f"• *Avancement Raydium :* `{progress_migration:.1f}%` (Seuil: {MIGRATION_MCAP:,.0f}$)\n"
                 f"• *Acheteurs Uniques :* `{unique_holders} wallets` 👥\n"
                 f"• *Pression Achat :* `{buy_ratio*100:.0f}% Buys` ({token_info['buys']}W / {token_info['sells']}L)\n"
-                f"• *Volume :* `{token_info['volume_usd']:,.0f}$`\n"
+                f"• *Volume Récent :* `{token_info['volume_usd']:,.0f}$`\n"
                 f"• *Âge du Jeton :* `{time_str}` ⏱️\n"
-                f"• *Objectif 100K$ :* `x{potential_x:.1f}` potentiel à la sortie\n\n"
+                f"• *Potentiel Objectif 100K$ :* `x{potential_x:.1f}`\n\n"
                 "📊 *Liens d'Entrée Rapide :*\n"
                 f"• [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\n"
                 f"• [BullX](https://bullx.io/terminal?chain=solana&address={mint})\n"
@@ -147,19 +152,22 @@ def analyser_trade_streaming(data: dict):
 
 async def solana_websocket_listener():
     uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Initialisation du flux global PumpPortal ===")
+    print("=== [BOT] Initialisation du Sniper Streaming WebSocket ===")
     
+    # Message test envoyé immédiatement au lancement pour valider tes identifiants Telegram
+    await send_telegram_alert("⚡ *Sniper Streaming Actif* — Mode Surveillance global en cours...", is_test=True)
+
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] 📡 Écoute en direct des créations et des volumes...")
+                print("[WEBSOCKET] 📡 Flux connecté. Écoute globale active.")
 
                 async for message in websocket:
                     try:
                         data = json.loads(message)
-                    except:
+                    except json.JSONDecodeError:
                         continue
                     
                     tx_type = data.get("txType")
@@ -169,6 +177,7 @@ async def solana_websocket_listener():
                         analyser_trade_streaming(data)
 
         except websockets.exceptions.ConnectionClosed:
+            print("[WEBSOCKET] Connexion perdue, reconnexion dans 3s...")
             await asyncio.sleep(3)
         except Exception as e:
             print(f"[WEBSOCKET ERREUR] -> {e}")
@@ -190,6 +199,6 @@ app = FastAPI(lifespan=lifespan)
 def health_check():
     return {
         "status": "online",
-        "market_mode": "SOL Low Market (65$)",
-        "tracked_tokens": len(tracked_tokens)
+        "market_mode": f"SOL Cible à {SOL_PRICE_USD}$",
+        "tracked_tokens_count": len(tracked_tokens)
     }

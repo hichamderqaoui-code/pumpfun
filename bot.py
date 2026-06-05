@@ -11,24 +11,25 @@ import time
 # ─── CONFIG ───
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
-TARGET_MCAP_USD   = float(os.getenv("TARGET_MCAP_USD",  "5000"))
-SOL_PRICE_USD     = float(os.getenv("SOL_PRICE_USD",    "75.33"))
-MIN_HOLDERS       = int(os.getenv("MIN_HOLDERS",         "5"))
+TARGET_MCAP_USD   = float(os.getenv("TARGET_MCAP_USD",  "3000"))
+SOL_PRICE_USD     = float(os.getenv("SOL_PRICE_USD",    "66.12"))
+MIN_HOLDERS       = int(os.getenv("MIN_HOLDERS",        "5"))
 MAX_AGE_SECONDS   = int(os.getenv("MAX_AGE_SECONDS",    "600"))
+MIGRATION_USD     = float(os.getenv("MIGRATION_USD",    "27000"))
 
-tracked_tokens = OrderedDict()
+tracked_tokens: OrderedDict = OrderedDict()
 MAX_TRACKED = 1000
-
-# ─── FILE D'ATTENTE pour les alertes Telegram ───
 alert_queue: asyncio.Queue = None
 
 
-def calculer_market_cap_sol(v_tokens: float) -> float:
-    TOTAL_SUPPLY = 1_000_000_000
-    if v_tokens <= 0:
-        return 0
-    price_per_token_sol = 30 / v_tokens
-    return TOTAL_SUPPLY * price_per_token_sol
+def calculer_market_cap_usd(data: dict) -> float:
+    mcap_sol = float(data.get("marketCapSol") or 0)
+    if mcap_sol > 0:
+        return mcap_sol * SOL_PRICE_USD
+    v_tokens = float(data.get("vTokenReserves") or 0) / 1e6
+    if v_tokens > 0:
+        return (30 / v_tokens) * 1_000_000_000 * SOL_PRICE_USD
+    return 0.0
 
 
 def register_new_token(data: dict):
@@ -44,16 +45,16 @@ def register_new_token(data: dict):
         "traders":    set(),
         "alerted":    False,
         "volume_usd": 0.0,
-        "tx_count":   0
+        "tx_count":   0,
     }
-    print(f"🆕 [WS CREATION] {data.get('name')} enregistré ({mint[:8]}...)")
+    print(f"🆕 [WS CREATION] {data.get('name')} ({mint[:8]}...)")
 
 
 async def send_telegram_alert(message: str, is_test: bool = False):
     token   = str(TELEGRAM_TOKEN).strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     if not token or not chat_id:
-        print(f"[TELEGRAM] ❌ MANQUANT token='{token[:10]}' chat_id='{chat_id}'")
+        print(f"[TELEGRAM] ❌ MANQUANT token='{token[:10]}...' chat_id='{chat_id}'")
         return
     url     = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
@@ -72,18 +73,20 @@ async def send_telegram_alert(message: str, is_test: bool = False):
 
 
 async def telegram_worker():
-    """Tâche dédiée qui envoie les alertes depuis la queue — évite le bug asyncio.create_task depuis sync"""
-    global alert_queue
     print("[TELEGRAM WORKER] ✅ Démarré.")
     while True:
-        message = await alert_queue.get()
-        await send_telegram_alert(message)
-        alert_queue.task_done()
-        await asyncio.sleep(0.5)  # anti-flood Telegram
+        try:
+            message = await asyncio.wait_for(alert_queue.get(), timeout=30.0)
+            await send_telegram_alert(message)
+            alert_queue.task_done()
+            await asyncio.sleep(0.5)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            print(f"[TELEGRAM WORKER] ❌ {e}")
 
 
 def analyser_trade_streaming(data: dict):
-    """Analyse les transactions en temps réel — enqueue l'alerte au lieu de créer une task"""
     mint = data.get("mint")
     if not mint or mint not in tracked_tokens:
         return
@@ -100,86 +103,100 @@ def analyser_trade_streaming(data: dict):
         return
 
     trader     = data.get("traderPublicKey")
-    sol_amount = float(data.get("solAmount", 0)) / 1e9
-    v_tokens   = float(data.get("vTokenReserves", 0)) / 1e6
+    sol_amount = float(data.get("solAmount") or 0) / 1e9
 
     if trader:
         token_info["traders"].add(trader)
 
     token_info["tx_count"]   += 1
-    token_info["volume_usd"] += (sol_amount * SOL_PRICE_USD)
+    token_info["volume_usd"] += sol_amount * SOL_PRICE_USD
 
-    mcap_sol = data.get("marketCapSol", 0)
-    if mcap_sol == 0 and v_tokens > 0:
-        mcap_sol = calculer_market_cap_sol(v_tokens)
-
-    mcap_usd       = mcap_sol * SOL_PRICE_USD
+    mcap_usd       = calculer_market_cap_usd(data)
     unique_holders = len(token_info["traders"])
+    bc_pct         = min((mcap_usd / MIGRATION_USD) * 100, 100) if MIGRATION_USD > 0 else 0
 
-    if token_info["tx_count"] % 3 == 0:
+    if token_info["tx_count"] % 5 == 0:
         print(
-            f"⚡ [STREAM] {token_info['name'][:12]:<12} | "
-            f"MC: {mcap_usd:,.0f}$ | "
+            f"⚡ [STREAM] {token_info['name'][:14]:<14} | "
+            f"MC: {mcap_usd:>8,.0f}$ | "
+            f"BC: {bc_pct:.0f}% | "
             f"Traders: {unique_holders} | "
-            f"Age: {elapsed:.0f}s"
+            f"{elapsed:.0f}s"
         )
 
-    if mcap_usd >= TARGET_MCAP_USD:
-        if unique_holders < MIN_HOLDERS:
-            return
+    # Pas encore au seuil
+    if mcap_usd < TARGET_MCAP_USD:
+        return
 
+    # Anti wash-trading
+    if unique_holders < MIN_HOLDERS:
+        return
+
+    # Déjà migré → trop tard
+    if mcap_usd >= MIGRATION_USD:
         token_info["alerted"] = True
+        print(f"[SKIP] {token_info['name']} déjà migré ({mcap_usd:,.0f}$)")
+        return
 
-        name     = token_info["name"]
-        symbol   = token_info["symbol"]
-        time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-        mult     = 100000 / mcap_usd if mcap_usd > 0 else 10
+    token_info["alerted"] = True
 
-        print(f"🎯 [ALERTE] {name} | MC: {mcap_usd:,.0f}$ | Traders: {unique_holders} | {time_str}")
+    name     = token_info["name"]
+    symbol   = token_info["symbol"]
+    time_str = f"{int(elapsed//60)}m {int(elapsed%60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+    mult_mig  = MIGRATION_USD / mcap_usd
+    mult_100k = 100000 / mcap_usd
+    reste_pct = 100 - bc_pct
 
-        message = (
-            f"🟢 *SIGNAL TEMPS RÉEL — PUMP FLASH*\n\n"
-            f"• *Nom :* {name} ({symbol})\n"
-            f"• *Market Cap :* `{mcap_usd:,.0f}$` 🚀\n"
-            f"• *Acheteurs Uniques :* `{unique_holders} portefeuilles` 👥\n"
-            f"• *Volume généré :* `{token_info['volume_usd']:,.0f}$`\n"
-            f"• *Total Transactions :* `{token_info['tx_count']}`\n"
-            f"• *Temps depuis création :* `{time_str}` ⏱️\n"
-            f"• *Objectif x100k :* `x{mult:.1f}`\n\n"
-            "🔍 *Outils de Sniping :*\n"
-            f"• [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\n"
-            f"• [BullX](https://bullx.io/terminal?chain=solana&address={mint})\n"
-            f"• [Dexscreener](https://dexscreener.com/solana/{mint})\n\n"
-            "📥 *Contrat (CA) :*\n"
-            f"`{mint}`"
-        )
+    print(f"🎯 [ALERTE] {name} | MC: {mcap_usd:,.0f}$ | BC: {bc_pct:.0f}% | Traders: {unique_holders} | {time_str}")
 
-        # ✅ FIX : on met en queue au lieu de create_task depuis une fonction sync
-        if alert_queue:
-            alert_queue.put_nowait(message)
-        else:
-            print("[TELEGRAM] ❌ Queue non initialisée !")
+    message = (
+        f"🟢 *SIGNAL PRÉ-MIGRATION — {bc_pct:.0f}% vers Raydium*\n\n"
+        f"• *Nom :* {name} ({symbol})\n"
+        f"• *Market Cap :* `{mcap_usd:,.0f}$`\n"
+        f"• *Bonding Curve :* `{bc_pct:.0f}%` — reste `{reste_pct:.0f}%` avant migration\n"
+        f"• *Acheteurs uniques :* `{unique_holders}`\n"
+        f"• *Volume :* `{token_info['volume_usd']:,.0f}$`\n"
+        f"• *Transactions :* `{token_info['tx_count']}`\n"
+        f"• *Âge :* `{time_str}` ⏱️\n\n"
+        f"📈 *Potentiel :*\n"
+        f"• x{mult_mig:.1f} jusqu'à migration (27K$)\n"
+        f"• x{mult_100k:.1f} jusqu'à 100K$\n\n"
+        "🔍 *Liens :*\n"
+        f"• [Pump.fun](https://pump.fun/{mint})\n"
+        f"• [BullX](https://bullx.io/terminal?chain=solana&address={mint})\n"
+        f"• [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\n"
+        f"• [Dexscreener](https://dexscreener.com/solana/{mint})\n\n"
+        "📥 *CA :*\n"
+        f"`{mint}`"
+    )
+
+    if alert_queue:
+        alert_queue.put_nowait(message)
+    else:
+        print("[TELEGRAM] ❌ Queue non initialisée !")
 
 
 async def solana_websocket_listener():
     uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Démarrage Sniper Streaming ===")
+    print("=== [BOT] Sniper Pré-Migration démarré ===")
     await send_telegram_alert(
-        f"⚡ *Sniper Streaming en ligne*\n\n"
-        f"💰 Cible MC : `{TARGET_MCAP_USD:,.0f}$`\n"
+        f"🚀 *Sniper Pré-Migration en ligne*\n\n"
+        f"💰 Alerte à : `{TARGET_MCAP_USD:,.0f}$` MC\n"
+        f"🎯 Migration Raydium : `{MIGRATION_USD:,.0f}$`\n"
         f"👥 Min traders : `{MIN_HOLDERS}`\n"
-        f"⏱️ Fenêtre max : `{MAX_AGE_SECONDS//60} min`\n\n"
-        "🟢 Alertes actives",
+        f"💵 SOL : `{SOL_PRICE_USD}$`\n"
+        f"⏱️ Fenêtre : `{MAX_AGE_SECONDS // 60} min`\n\n"
+        "Entrée 3-8K$ → Sortie 50-100K$ 🎯",
         is_test=True
     )
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                print("[WEBSOCKET] ✅ Flux connecté.")
+                print("[WEBSOCKET] ✅ Connecté.")
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] 📡 Surveillance globale active.")
+                print("[WEBSOCKET] 📡 Streaming global actif.")
 
                 async for message in websocket:
                     try:
@@ -224,12 +241,13 @@ app = FastAPI(lifespan=lifespan)
 def home():
     return {
         "status":          "active",
-        "mode":            "Streaming WebSocket",
+        "sol_price_usd":   SOL_PRICE_USD,
         "target_mcap_usd": TARGET_MCAP_USD,
+        "migration_usd":   MIGRATION_USD,
         "min_holders":     MIN_HOLDERS,
         "max_age_seconds": MAX_AGE_SECONDS,
         "tracked_tokens":  len(tracked_tokens),
-        "queue_size":      alert_queue.qsize() if alert_queue else 0
+        "queue_size":      alert_queue.qsize() if alert_queue else 0,
     }
 
 

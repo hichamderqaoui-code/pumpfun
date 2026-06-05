@@ -13,14 +13,14 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
 
-# Seuil déclencheur unique réclamé
-MIN_TRACK_MCAP    = 7000.0   
+# 🎯 CONFIGURATION FILTRE STRETCH (Axiom Pro Mode)
+MIN_STRETCH_MCAP   = 8000.0   # Début de la zone Stretch
+MAX_STRETCH_MCAP   = 15000.0  # Fin de la zone d'alerte Stretch
 
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 2000  # Capacité augmentée pour suivre le flux global sans saturation
+MAX_TRACKED = 2000  
 
 def safe_float(value, default=0.0) -> float:
-    """Sécurise les conversions numériques contre les payloads d'API corrompus"""
     if value is None:
         return default
     try:
@@ -47,7 +47,6 @@ async def send_telegram_alert(message: str, is_test: bool = False):
     token = str(TELEGRAM_TOKEN).strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     if not token or not chat_id:
-        print("[TELEGRAM] Identifiants manquants dans les variables d'environnement.")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -63,20 +62,19 @@ async def send_telegram_alert(message: str, is_test: bool = False):
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, timeout=5.0)
             if response.status_code != 200:
-                print(f"[TELEGRAM ERREUR API] Code {response.status_code} -> {response.text}")
+                print(f"[TELEGRAM ERREUR] -> {response.text}")
     except Exception as e:
-        print(f"[TELEGRAM ERREUR CONNEXION] -> {e}")
+        print(f"[TELEGRAM ERREUR] -> {e}")
 
 def analyser_trade_streaming(data: dict):
     mint = data.get("mint")
     if not mint:
         return
 
-    # Mécanisme d'auto-apprentissage si le trade devance le flux de création pure
     if mint not in tracked_tokens:
         register_new_token({
             "mint": mint,
-            "name": data.get("name", "Jeton Inconnu"),
+            "name": data.get("name", "Jeton"),
             "symbol": data.get("symbol", "MEME")
         })
 
@@ -84,13 +82,13 @@ def analyser_trade_streaming(data: dict):
     if token_info["alerted"]:
         return
 
-    # Calcul temps réel calqué sur le marketCapSol natif de PumpPortal
+    # Calcul du Market Cap instantané
     mcap_sol_brut = safe_float(data.get("marketCapSol"))
     mcap_usd = mcap_sol_brut * SOL_PRICE_USD
 
-    # 🎯 TRIGGER STRATÉGIQUE : Alerte immédiate dès le passage des 7 000 $
-    if mcap_usd >= MIN_TRACK_MCAP:
-        token_info["alerted"] = True  # Verrouillage pour éviter les doublons d'alertes
+    # 🎯 FILTRE DE LA COLONNE STRETCH
+    if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
+        token_info["alerted"] = True  
         
         name = token_info["name"]
         symbol = token_info["symbol"]
@@ -98,13 +96,13 @@ def analyser_trade_streaming(data: dict):
         elapsed = now - token_info["created_at"]
         time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-        print(f"🔥 [ALERTE SEUIL] {name} a franchi les 7000$ ({mcap_usd:,.0f}$) ! Envoi Telegram...")
+        print(f"📈 [STRETCH DETECTED] {name} entre dans la zone Stretch ({mcap_usd:,.0f}$) ! Alerte Telegram...")
 
         message = (
-            f"🎯 <b>SEUIL DES 7,000$ ATTEINT</b> 🎯\n\n"
+            f"📈 <b>ZONING STRETCH (AXIOM MODE)</b> 📈\n\n"
             f"• <b>Nom :</b> {name} ({symbol})\n"
             f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-            f"• <b>Temps écoulé depuis création :</b> <code>{time_str}</code> ⏱️\n\n"
+            f"• <b>Âge du Jeton :</b> <code>{time_str}</code> ⏱️\n\n"
             "📊 <b>Liens d'Entrée Rapide :</b>\n"
             f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
             f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n"
@@ -116,20 +114,17 @@ def analyser_trade_streaming(data: dict):
 
 async def solana_websocket_listener():
     uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Initialisation du Sniper 7000$ MCAP ===")
+    print("=== [BOT] Initialisation du Sniper Mode STRETCH ===")
     
-    # Étape 1 : Temporisation réseau pour laisser le conteneur Railway s'établir complètement
     await asyncio.sleep(2)
-    
-    # Étape 2 : Envoi asynchrone découplé pour ne pas bloquer le démarrage de la boucle infinie
-    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper 7000$ MCAP Actif</b> — Écoute globale en cours...", is_test=True))
+    asyncio.create_task(send_telegram_alert("📡 <b>Mode Stretch Axiom Actif</b> — Surveillance de la zone 8k$-15k$ en cours...", is_test=True))
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] 📡 Flux connecté. Analyse de tous les jetons active.")
+                print("[WEBSOCKET] 📡 Flux connecté. Scan Stretch en cours.")
 
                 async for message in websocket:
                     try:
@@ -170,6 +165,6 @@ app = FastAPI(lifespan=lifespan)
 def health_check():
     return {
         "status": "online",
-        "mode": "Alerte immédiate au passage des 7000$",
+        "mode": "Alerte entrée colonne Stretch (8k$-15k$)",
         "tracked_tokens_count": len(tracked_tokens)
     }

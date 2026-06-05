@@ -12,8 +12,9 @@ import time
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
+HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 
-# 🎯 CRITÈRES NOUVELLES PAIRES (Axiom Stretch Mode)
+# 🎯 CONFIGURATION STRATÉGIE EXPLOSION (STRETCH)
 MIN_STRETCH_MCAP   = 8000.0   
 MAX_STRETCH_MCAP   = 15000.0  
 MAX_TOKEN_AGE_SEC  = 900.0    # 15 minutes max
@@ -30,15 +31,13 @@ def safe_float(value, default=0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-def register_new_token(mint: str, name: str, symbol: str):
+def register_new_token(mint: str):
     if not mint or mint in tracked_tokens:
         return
     if len(tracked_tokens) >= MAX_TRACKED:
         tracked_tokens.popitem(last=False)
         
     tracked_tokens[mint] = {
-        "name": name,
-        "symbol": symbol,
         "created_at": time.time(),
         "alerted": False
     }
@@ -62,83 +61,116 @@ async def send_telegram_alert(message: str):
     except Exception as e:
         print(f"[TELEGRAM ERREUR] -> {e}")
 
-def analyser_trade_streaming(data: dict):
-    mint = data.get("mint")
+def analyser_logs_solana(params: dict):
+    result = params.get("result", {})
+    value = result.get("value", {})
+    logs = value.get("logs", [])
+    
+    # On cherche si la transaction implique le programme Pump.fun
+    is_pump_transaction = False
+    for log in logs:
+        if "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz" in log or "Program log: Instruction:" in log:
+            is_pump_transaction = True
+            break
+            
+    if not is_pump_transaction:
+        return
+
+    # Extraction des changements de jetons pour identifier le mint
+    # On se base sur une structure simplifiée de transaction validée
+    tx = value.get("transaction", {})
+    meta = tx.get("meta", {}) if tx else {}
+    if not meta:
+        return
+        
+    post_balances = meta.get("postTokenBalances", [])
+    mint = None
+    ui_amount = 0.0
+    
+    for balance in post_balances:
+        if balance.get("owner") == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz":
+            mint = balance.get("mint")
+            ui_amount = safe_float(balance.get("uiTokenAmount", {}).get("uiAmount"))
+            break
+
     if not mint:
         return
 
+    now = time.time()
     if mint not in tracked_tokens:
-        register_new_token(mint, data.get("name", "Jeton"), data.get("symbol", "PUMP"))
+        register_new_token(mint)
 
     token_info = tracked_tokens[mint]
-    if token_info["alerted"]:
+    if token_info["alerted"] or (now - token_info["created_at"]) > MAX_TOKEN_AGE_SEC:
         return
 
-    # Vérification de l'âge du token
-    now = time.time()
-    if (now - token_info["created_at"]) > MAX_TOKEN_AGE_SEC:
-        return
+    if ui_amount > 0:
+        # Estimation du Market Cap basé sur les tokens restants dans la courbe
+        mcap_sol = (1000000000 - ui_amount) * 0.00000003 + 30 
+        mcap_usd = mcap_sol * SOL_PRICE_USD
 
-    mcap_sol_brut = safe_float(data.get("marketCapSol"))
-    mcap_usd = mcap_sol_brut * SOL_PRICE_USD
+        if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
+            token_info["alerted"] = True
+            elapsed = now - token_info["created_at"]
+            time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-    if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
-        token_info["alerted"] = True
-        elapsed = now - token_info["created_at"]
-        time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+            print(f"🔥 [EXPLOSION DETECTED] Token {mint} à {mcap_usd:,.0f}$")
 
-        print(f"🔥 [EXPLOSION] {token_info['name']} à {mcap_usd:,.0f}$")
-
-        message = (
-            f"⚡ <b>NOUVELLE PAIRE EN EXPLOSION</b> ⚡\n\n"
-            f"• <b>Nom :</b> {token_info['name']} ({token_info['symbol']})\n"
-            f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-            f"• <b>Depuis création :</b> <code>{time_str}</code> 🔥\n\n"
-            f"📊 <b>Sniper Direct :</b>\n"
-            f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
-            f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
-            f"📥 <b>CA :</b> <code>{mint}</code>"
-        )
-        asyncio.create_task(send_telegram_alert(message))
+            message = (
+                f"⚡ <b>NOUVELLE PAIRE EN EXPLOSION (RPC)</b> ⚡\n\n"
+                f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
+                f"• <b>Âge de la paire :</b> <code>{time_str}</code> 🔥\n\n"
+                f"📊 <b>Outils de Sniping :</b>\n"
+                f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
+                f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
+                f"📥 <b>CA :</b> <code>{mint}</code>"
+            )
+            asyncio.create_task(send_telegram_alert(message))
 
 async def solana_websocket_listener():
     global TOTAL_MESSAGES_RECEIVED
-    uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Retour sur Flux PumpPortal Standard ===")
+    if not HELIUS_API_KEY.strip():
+        print("[ERREUR] La variable HELIUS_API_KEY n'est pas configurée dans Railway !")
+        return
+
+    # L'adresse WebSocket correcte et standard d'Helius
+    uri = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    print("=== [BOT] Connexion WebSocket RPC Helius ===")
     
     await asyncio.sleep(2)
-    asyncio.create_task(send_telegram_alert("📡 <b>Sniper Mode Actif</b> — Surveillance de la zone Stretch 8k$-15k$..."))
+    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper RPC Helius Connecté</b> — Scan des nouvelles paires explosives en cours..."))
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                # On s'abonne aux lancements ET aux trades
-                await websocket.send(json.dumps({"method": "subscribeNewToken"}))
-                await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] Connecxion établie. Analyse du flux en cours.")
+                # Abonnement aux logs du programme de Pump.fun
+                subscribe_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {"mentions": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5AMX787Nz"]},
+                        {"commitment": "confirmed"}
+                    ]
+                }
+                await websocket.send(json.dumps(subscribe_payload))
+                print("[HELIUS RPC] 📡 Flux WebSocket raccordé à Solana.")
 
                 async for message in websocket:
                     TOTAL_MESSAGES_RECEIVED += 1
-                    if TOTAL_MESSAGES_RECEIVED % 200 == 0:
-                        print(f"[LIVE CHECK] {TOTAL_MESSAGES_RECEIVED} transactions analysées...")
+                    if TOTAL_MESSAGES_RECEIVED % 50 == 0:
+                        print(f"[RPC CHECK] {TOTAL_MESSAGES_RECEIVED} logs réseau analysés...")
 
                     try:
                         data = json.loads(message)
-                    except json.JSONDecodeError:
+                        params = data.get("params")
+                        if params:
+                            analyser_logs_solana(params)
+                    except Exception:
                         continue
 
-                    tx_type = data.get("txType")
-                    event_type = data.get("eventType")
-                    mint = data.get("mint")
-
-                    if mint:
-                        if tx_type == "create" or event_type == "create":
-                            register_new_token(mint, data.get("name", "Unknown"), data.get("symbol", "TOKEN"))
-                        elif tx_type in ["buy", "sell"]:
-                            analyser_trade_streaming(data)
-
         except Exception as e:
-            print(f"[WEBSOCKET RETRY] Erreur de connexion ({e}), reconnexion dans 3s...")
+            print(f"[RPC RETRY] Déconnexion ({e}), tentative dans 3s...")
             await asyncio.sleep(3)
 
 @asynccontextmanager
@@ -157,6 +189,6 @@ app = FastAPI(lifespan=lifespan)
 def health_check():
     return {
         "status": "online",
-        "total_messages_processed": TOTAL_MESSAGES_RECEIVED,
-        "tracked_tokens_count": len(tracked_tokens)
+        "messages_scanned": TOTAL_MESSAGES_RECEIVED,
+        "tracked_count": len(tracked_tokens)
     }

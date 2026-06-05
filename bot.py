@@ -13,13 +13,14 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
 
-# Seuil déclencheur unique
+# Seuil déclencheur unique réclamé
 MIN_TRACK_MCAP    = 7000.0   
 
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 2000  # Augmenté pour encaisser le flux global
+MAX_TRACKED = 2000  # Capacité augmentée pour suivre le flux global sans saturation
 
 def safe_float(value, default=0.0) -> float:
+    """Sécurise les conversions numériques contre les payloads d'API corrompus"""
     if value is None:
         return default
     try:
@@ -46,6 +47,7 @@ async def send_telegram_alert(message: str, is_test: bool = False):
     token = str(TELEGRAM_TOKEN).strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     if not token or not chat_id:
+        print("[TELEGRAM] Identifiants manquants dans les variables d'environnement.")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -61,20 +63,20 @@ async def send_telegram_alert(message: str, is_test: bool = False):
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, timeout=5.0)
             if response.status_code != 200:
-                print(f"[TELEGRAM ERREUR] -> {response.text}")
+                print(f"[TELEGRAM ERREUR API] Code {response.status_code} -> {response.text}")
     except Exception as e:
-        print(f"[TELEGRAM ERREUR] -> {e}")
+        print(f"[TELEGRAM ERREUR CONNEXION] -> {e}")
 
 def analyser_trade_streaming(data: dict):
     mint = data.get("mint")
     if not mint:
         return
 
-    # Si le token n'est pas encore enregistré dans le dictionnaire, on l'ajoute à la volée
+    # Mécanisme d'auto-apprentissage si le trade devance le flux de création pure
     if mint not in tracked_tokens:
         register_new_token({
             "mint": mint,
-            "name": data.get("name", "Jeton"),
+            "name": data.get("name", "Jeton Inconnu"),
             "symbol": data.get("symbol", "MEME")
         })
 
@@ -82,13 +84,13 @@ def analyser_trade_streaming(data: dict):
     if token_info["alerted"]:
         return
 
-    # Calcul en temps réel du Market Cap en USD
+    # Calcul temps réel calqué sur le marketCapSol natif de PumpPortal
     mcap_sol_brut = safe_float(data.get("marketCapSol"))
     mcap_usd = mcap_sol_brut * SOL_PRICE_USD
 
-    # 🎯 TRIGGER UNIQUE : Dès qu'on passe les 7000$ de MCAP
+    # 🎯 TRIGGER STRATÉGIQUE : Alerte immédiate dès le passage des 7 000 $
     if mcap_usd >= MIN_TRACK_MCAP:
-        token_info["alerted"] = True  # One-shot : une seule alerte par token
+        token_info["alerted"] = True  # Verrouillage pour éviter les doublons d'alertes
         
         name = token_info["name"]
         symbol = token_info["symbol"]
@@ -102,7 +104,7 @@ def analyser_trade_streaming(data: dict):
             f"🎯 <b>SEUIL DES 7,000$ ATTEINT</b> 🎯\n\n"
             f"• <b>Nom :</b> {name} ({symbol})\n"
             f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-            f"• <b>Temps depuis création :</b> <code>{time_str}</code> ⏱️\n\n"
+            f"• <b>Temps écoulé depuis création :</b> <code>{time_str}</code> ⏱️\n\n"
             "📊 <b>Liens d'Entrée Rapide :</b>\n"
             f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
             f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n"
@@ -116,8 +118,11 @@ async def solana_websocket_listener():
     uri = "wss://pumpportal.fun/api/data"
     print("=== [BOT] Initialisation du Sniper 7000$ MCAP ===")
     
-    # Message de test immédiat au déploiement
-    await send_telegram_alert("⚡ <b>Sniper 7000$ MCAP Actif</b> — Écoute globale en cours...", is_test=True)
+    # Étape 1 : Temporisation réseau pour laisser le conteneur Railway s'établir complètement
+    await asyncio.sleep(2)
+    
+    # Étape 2 : Envoi asynchrone découplé pour ne pas bloquer le démarrage de la boucle infinie
+    asyncio.create_task(send_telegram_alert("⚡ <b>Sniper 7000$ MCAP Actif</b> — Écoute globale en cours...", is_test=True))
 
     while True:
         try:
@@ -143,7 +148,7 @@ async def solana_websocket_listener():
                             analyser_trade_streaming(data)
 
         except websockets.exceptions.ConnectionClosed:
-            print("[WEBSOCKET] Connexion fermue, reconnexion dans 3s...")
+            print("[WEBSOCKET] Connexion perdue, reconnexion dans 3s...")
             await asyncio.sleep(3)
         except Exception as e:
             print(f"[WEBSOCKET ERREUR] -> {e}")

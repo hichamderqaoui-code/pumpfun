@@ -11,25 +11,15 @@ import time
 # ─── CONFIGURATION VIA VARIABLES D'ENVIRONNEMENT ───
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Ajustement automatique au marché (SOL configuré sur Railway)
 SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
-MIGRATION_MCAP    = float(os.getenv("MIGRATION_USD", "27000.0"))  # Seuil de migration Raydium
 
-# Zone d'entrée cible configurée via Railway (ex: 12000)
-MAX_TRACK_MCAP    = float(os.getenv("TARGET_MCAP_USD", "12000.0"))  
+# Seuil déclencheur unique
 MIN_TRACK_MCAP    = 7000.0   
 
-# Filtres de qualité anti-spam
-MIN_UNIQUE_TRADERS = int(os.getenv("MIN_HOLDERS", "5"))     # Sécurité traders uniques
-MIN_TX_COUNT       = 15      # Minimum d'activité sur la curve
-MAX_AGE_SECONDS    = int(os.getenv("MAX_AGE_SECONDS", "600"))    # Fenêtre max (ex: 10 minutes)
-
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 1000
+MAX_TRACKED = 2000  # Augmenté pour encaisser le flux global
 
 def safe_float(value, default=0.0) -> float:
-    """Sécurise la conversion en float pour éviter les crashs sur payloads corrompus"""
     if value is None:
         return default
     try:
@@ -47,16 +37,10 @@ def register_new_token(data: dict):
         
     tracked_tokens[mint] = {
         "name": data.get("name", "Unknown"),
-        "symbol": data.get("symbol", "MEME"),
+        "symbol": data.get("symbol", "TOKEN"),
         "created_at": time.time(),
-        "traders": set(),
-        "alerted": False,
-        "volume_usd": 0.0,
-        "tx_count": 0,
-        "buys": 0,
-        "sells": 0
+        "alerted": False
     }
-    print(f"🆕 [WS CREATION] {data.get('name')} enregistré ({mint[:8]}...)")
 
 async def send_telegram_alert(message: str, is_test: bool = False):
     token = str(TELEGRAM_TOKEN).strip()
@@ -70,12 +54,14 @@ async def send_telegram_alert(message: str, is_test: bool = False):
         "text": message
     }
     if not is_test:
-        payload["parse_mode"] = "Markdown"
+        payload["parse_mode"] = "HTML"
         payload["disable_web_page_preview"] = True
         
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(url, json=payload, timeout=5.0)
+            response = await client.post(url, json=payload, timeout=5.0)
+            if response.status_code != 200:
+                print(f"[TELEGRAM ERREUR] -> {response.text}")
     except Exception as e:
         print(f"[TELEGRAM ERREUR] -> {e}")
 
@@ -84,104 +70,61 @@ def analyser_trade_streaming(data: dict):
     if not mint:
         return
 
-    # Auto-apprentissage : Si le trade arrive avant le message de création, on l'enregistre à la volée
+    # Si le token n'est pas encore enregistré dans le dictionnaire, on l'ajoute à la volée
     if mint not in tracked_tokens:
         register_new_token({
             "mint": mint,
-            "name": data.get("name", "Unknown Jeton"),
-            "symbol": data.get("symbol", "TOKEN")
+            "name": data.get("name", "Jeton"),
+            "symbol": data.get("symbol", "MEME")
         })
 
     token_info = tracked_tokens[mint]
     if token_info["alerted"]:
         return
 
-    now = time.time()
-    elapsed = now - token_info["created_at"]
-
-    if elapsed > MAX_AGE_SECONDS:
-        token_info["alerted"] = True
-        return
-
-    # Extraction sécurisée des données numériques pour éviter les crashs
-    trader = data.get("traderPublicKey")
-    sol_amount = safe_float(data.get("solAmount")) / 1e9  
-    
-    if trader:
-        token_info["traders"].add(trader)
-        
-    token_info["tx_count"] += 1
-    token_info["volume_usd"] += (sol_amount * SOL_PRICE_USD)
-
-    tx_type = data.get("txType")
-    if tx_type == "buy":
-        token_info["buys"] += 1
-    elif tx_type == "sell":
-        token_info["sells"] += 1
-
-    # Calcul fiable basé sur le marketCapSol natif de l'API de PumpPortal
+    # Calcul en temps réel du Market Cap en USD
     mcap_sol_brut = safe_float(data.get("marketCapSol"))
     mcap_usd = mcap_sol_brut * SOL_PRICE_USD
-    
-    unique_holders = len(token_info["traders"])
 
-    # Log discret de streaming d'activité toutes les 5 transactions
-    if token_info["tx_count"] % 5 == 0:
-        print(f"⚡ [STREAM] {token_info['name'][:12]:<12} | MC: {mcap_usd:,.0f}$ | Traders: {unique_holders}")
+    # 🎯 TRIGGER UNIQUE : Dès qu'on passe les 7000$ de MCAP
+    if mcap_usd >= MIN_TRACK_MCAP:
+        token_info["alerted"] = True  # One-shot : une seule alerte par token
+        
+        name = token_info["name"]
+        symbol = token_info["symbol"]
+        now = time.time()
+        elapsed = now - token_info["created_at"]
+        time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-    # 🎯 VALIDATION DE LA STRATÉGIE ET DES FILTRES
-    if MIN_TRACK_MCAP <= mcap_usd <= MAX_TRACK_MCAP:
-        if unique_holders >= MIN_UNIQUE_TRADERS and token_info["tx_count"] >= MIN_TX_COUNT:
-            
-            total_tx = token_info["buys"] + token_info["sells"]
-            buy_ratio = token_info["buys"] / total_tx if total_tx > 0 else 0
-            
-            # Exigence de 65% de pression acheteuse pour éviter les rug/dumps rapides
-            if buy_ratio < 0.65:
-                return
+        print(f"🔥 [ALERTE SEUIL] {name} a franchi les 7000$ ({mcap_usd:,.0f}$) ! Envoi Telegram...")
 
-            token_info["alerted"] = True
-            
-            name = token_info["name"]
-            symbol = token_info["symbol"]
-            progress_migration = (mcap_usd / MIGRATION_MCAP) * 100
-            time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-            potential_x = 100000.0 / mcap_usd if mcap_usd > 0 else 0
-
-            print(f"🔥 [ALERTE] {name} validé ! Envoi Telegram...")
-
-            message = (
-                f"🚀 *PÉPITE DÉTECTÉE (CIBLE PRÉ-MIGRATION)* 🚀\n\n"
-                f"• *Nom :* {name} ({symbol})\n"
-                f"• *Market Cap Actuel :* `{mcap_usd:,.0f}$` 💰\n"
-                f"• *Avancement Raydium :* `{progress_migration:.1f}%` (Seuil: {MIGRATION_MCAP:,.0f}$)\n"
-                f"• *Acheteurs Uniques :* `{unique_holders} wallets` 👥\n"
-                f"• *Pression Achat :* `{buy_ratio*100:.0f}% Buys` ({token_info['buys']}W / {token_info['sells']}L)\n"
-                f"• *Volume Récent :* `{token_info['volume_usd']:,.0f}$`\n"
-                f"• *Âge du Jeton :* `{time_str}` ⏱️\n"
-                f"• *Potentiel Objectif 100K$ :* `x{potential_x:.1f}`\n\n"
-                "📊 *Liens d'Entrée Rapide :*\n"
-                f"• [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\n"
-                f"• [BullX](https://bullx.io/terminal?chain=solana&address={mint})\n"
-                f"• [Dexscreener](https://dexscreener.com/solana/{mint})\n\n"
-                "📥 *Adresse du Contrat (CA) :*\n"
-                f"`{mint}`"
-            )
-            asyncio.create_task(send_telegram_alert(message))
+        message = (
+            f"🎯 <b>SEUIL DES 7,000$ ATTEINT</b> 🎯\n\n"
+            f"• <b>Nom :</b> {name} ({symbol})\n"
+            f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
+            f"• <b>Temps depuis création :</b> <code>{time_str}</code> ⏱️\n\n"
+            "📊 <b>Liens d'Entrée Rapide :</b>\n"
+            f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
+            f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n"
+            f"• <a href='https://dexscreener.com/solana/{mint}'>Dexscreener</a>\n\n"
+            "📥 <b>Adresse du Contrat (CA) :</b>\n"
+            f"<code>{mint}</code>"
+        )
+        asyncio.create_task(send_telegram_alert(message))
 
 async def solana_websocket_listener():
     uri = "wss://pumpportal.fun/api/data"
-    print("=== [BOT] Initialisation du Sniper Streaming WebSocket ===")
+    print("=== [BOT] Initialisation du Sniper 7000$ MCAP ===")
     
-    # Message test envoyé au lancement
-    await send_telegram_alert("⚡ *Sniper Streaming Actif* — Mode Surveillance global en cours...", is_test=True)
+    # Message de test immédiat au déploiement
+    await send_telegram_alert("⚡ <b>Sniper 7000$ MCAP Actif</b> — Écoute globale en cours...", is_test=True)
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] 📡 Flux connecté. Écoute globale active.")
+                print("[WEBSOCKET] 📡 Flux connecté. Analyse de tous les jetons active.")
 
                 async for message in websocket:
                     try:
@@ -189,22 +132,18 @@ async def solana_websocket_listener():
                     except json.JSONDecodeError:
                         continue
                     
-                    # Détection robuste selon les clés présentes dans le dictionnaire
-                    # PumpPortal marque l'action de création par la clé "arguments" ou la méthode, ou l'absence de txType traditionnel
                     tx_type = data.get("txType")
                     event_type = data.get("eventType")
                     
                     if tx_type == "create" or event_type == "create" or "message" in data:
-                        # Si c'est un message système ou de création pure
                         if data.get("mint"):
                             register_new_token(data)
                     else:
-                        # Par défaut, si on reçoit un flux d'activité de transaction
                         if tx_type in ["buy", "sell"]:
                             analyser_trade_streaming(data)
 
         except websockets.exceptions.ConnectionClosed:
-            print("[WEBSOCKET] Connexion perdue, reconnexion dans 3s...")
+            print("[WEBSOCKET] Connexion fermue, reconnexion dans 3s...")
             await asyncio.sleep(3)
         except Exception as e:
             print(f"[WEBSOCKET ERREUR] -> {e}")
@@ -226,6 +165,6 @@ app = FastAPI(lifespan=lifespan)
 def health_check():
     return {
         "status": "online",
-        "market_mode": f"SOL Cible à {SOL_PRICE_USD}$",
+        "mode": "Alerte immédiate au passage des 7000$",
         "tracked_tokens_count": len(tracked_tokens)
     }

@@ -17,11 +17,11 @@ SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))
 MIN_STRETCH_MCAP   = 8000.0   # Début de la zone Stretch
 MAX_STRETCH_MCAP   = 15000.0  # Fin de la zone d'alerte Stretch
 
-# ─── COMPTEUR DE VÉRIFICATION EN DIRECT ───
-TOTAL_TRADES_ANALYSED = 0
+# Compteur global de messages reçus
+TOTAL_MESSAGES_RECEIVED = 0
 
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 2000  
+MAX_TRACKED = 3000  # Augmenté pour stocker plus de tokens en mémoire
 
 def safe_float(value, default=0.0) -> float:
     if value is None:
@@ -31,8 +31,7 @@ def safe_float(value, default=0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-def register_new_token(data: dict):
-    mint = data.get("mint")
+def register_new_token(mint: str, name: str = "Unknown", symbol: str = "TOKEN"):
     if not mint or mint in tracked_tokens:
         return
     
@@ -40,13 +39,13 @@ def register_new_token(data: dict):
         tracked_tokens.popitem(last=False)
         
     tracked_tokens[mint] = {
-        "name": data.get("name", "Unknown"),
-        "symbol": data.get("symbol", "TOKEN"),
+        "name": name,
+        "symbol": symbol,
         "created_at": time.time(),
         "alerted": False
     }
 
-async def send_telegram_alert(message: str, is_test: bool = False):
+async def send_telegram_alert(message: str):
     token = str(TELEGRAM_TOKEN).strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     if not token or not chat_id:
@@ -55,37 +54,31 @@ async def send_telegram_alert(message: str, is_test: bool = False):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id, 
-        "text": message
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
-    if not is_test:
-        payload["parse_mode"] = "HTML"
-        payload["disable_web_page_preview"] = True
         
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, timeout=5.0)
             if response.status_code != 200:
-                print(f"[TELEGRAM ERREUR] -> {response.text}")
+                print(f"[TELEGRAM ERREUR API] -> {response.text}")
     except Exception as e:
-        print(f"[TELEGRAM ERREUR] -> {e}")
+        print(f"[TELEGRAM ERREUR CONNEXION] -> {e}")
 
 def analyser_trade_streaming(data: dict):
-    global TOTAL_TRADES_ANALYSED
     mint = data.get("mint")
     if not mint:
         return
 
-    # 📈 COMPTEUR LIVE : Affiche l'activité en tâche de fond toutes les 500 transactions reçues
-    TOTAL_TRADES_ANALYSED += 1
-    if TOTAL_TRADES_ANALYSED % 500 == 0:
-        print(f"[LIVE CHECK] Bot actif. {TOTAL_TRADES_ANALYSED} transactions analysées en tâche de fond...")
-
+    # Si le token n'est pas encore suivi, on l'enregistre immédiatement
     if mint not in tracked_tokens:
-        register_new_token({
-            "mint": mint,
-            "name": data.get("name", "Jeton"),
-            "symbol": data.get("symbol", "MEME")
-        })
+        register_new_token(
+            mint, 
+            name=data.get("name", "Jeton"), 
+            symbol=data.get("symbol", "MEME")
+        )
 
     token_info = tracked_tokens[mint]
     if token_info["alerted"]:
@@ -95,7 +88,7 @@ def analyser_trade_streaming(data: dict):
     mcap_sol_brut = safe_float(data.get("marketCapSol"))
     mcap_usd = mcap_sol_brut * SOL_PRICE_USD
 
-    # 🎯 FILTRE DE LA COLONNE STRETCH (8k$ - 15k$)
+    # 🎯 VERIFICATION DE LA ZONE STRETCH
     if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
         token_info["alerted"] = True  
         
@@ -105,7 +98,7 @@ def analyser_trade_streaming(data: dict):
         elapsed = now - token_info["created_at"]
         time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-        print(f"🔥 [STRETCH DETECTED] {name} entre dans la zone Stretch ({mcap_usd:,.0f}$) ! Alerte Telegram...")
+        print(f"🔥 [STRETCH DETECTED] {name} est dans la colonne Stretch ({mcap_usd:,.0f}$) !")
 
         message = (
             f"📈 <b>ZONING STRETCH (AXIOM MODE)</b> 📈\n\n"
@@ -122,37 +115,51 @@ def analyser_trade_streaming(data: dict):
         asyncio.create_task(send_telegram_alert(message))
 
 async def solana_websocket_listener():
+    global TOTAL_MESSAGES_RECEIVED
     uri = "wss://pumpportal.fun/api/data"
     print("=== [BOT] Initialisation du Sniper Mode STRETCH ===")
     
     await asyncio.sleep(2)
-    asyncio.create_task(send_telegram_alert("📡 <b>Mode Stretch Axiom Actif</b> — Surveillance de la zone 8k$-15k$ avec indicateur d'activité...", is_test=True))
+    asyncio.create_task(send_telegram_alert("📡 <b>Mode Stretch Axiom Actif</b> — Surveillance en temps réel de la zone 8k$-15k$."))
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
+                # Souscriptions aux flux de PumpPortal
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 await websocket.send(json.dumps({"method": "subscribeAllTokenTrades"}))
-                print("[WEBSOCKET] 📡 Flux connecté. Scan Stretch en cours.")
+                print("[WEBSOCKET] 📡 Flux connecté. Écoute globale démarrée.")
 
                 async for message in websocket:
+                    TOTAL_MESSAGES_RECEIVED += 1
+                    
+                    # Log de contrôle immédiat toutes les 100 données reçues du réseau
+                    if TOTAL_MESSAGES_RECEIVED % 100 == 0:
+                        print(f"[LIVE CHECK] Flux actif : {TOTAL_MESSAGES_RECEIVED} messages traités par le bot...")
+
                     try:
                         data = json.loads(message)
                     except json.JSONDecodeError:
                         continue
                     
+                    # Interception des créations et des transactions
                     tx_type = data.get("txType")
                     event_type = data.get("eventType")
+                    mint = data.get("mint")
                     
-                    if tx_type == "create" or event_type == "create" or "message" in data:
-                        if data.get("mint"):
-                            register_new_token(data)
-                    else:
-                        if tx_type in ["buy", "sell"]:
+                    if mint:
+                        if tx_type == "create" or event_type == "create":
+                            register_new_token(
+                                mint, 
+                                name=data.get("name", "Unknown"), 
+                                symbol=data.get("symbol", "TOKEN")
+                            )
+                        else:
+                            # Traitement de toutes les actions d'achat/vente
                             analyser_trade_streaming(data)
 
         except websockets.exceptions.ConnectionClosed:
-            print("[WEBSOCKET] Connexion perdue, reconnexion dans 3s...")
+            print("[WEBSOCKET] Connexion interrompue, reconnexion dans 3s...")
             await asyncio.sleep(3)
         except Exception as e:
             print(f"[WEBSOCKET ERREUR] -> {e}")
@@ -174,7 +181,7 @@ app = FastAPI(lifespan=lifespan)
 def health_check():
     return {
         "status": "online",
-        "mode": "Alerte entrée colonne Stretch (8k$-15k$)",
-        "tracked_tokens_count": len(tracked_tokens),
-        "total_trades_processed": TOTAL_TRADES_ANALYSED
+        "mode": "Alerte colonne Stretch Axiom (8k$-15k$)",
+        "total_messages_processed": TOTAL_MESSAGES_RECEIVED,
+        "tracked_tokens_count": len(tracked_tokens)
     }

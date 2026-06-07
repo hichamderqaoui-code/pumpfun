@@ -11,7 +11,7 @@ import time
 # ─── CONFIGURATION ───
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "65.00"))  
+SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "61.73"))  
 
 # 🎯 ZONE STRETCH AXIOM PRO
 MIN_STRETCH_MCAP   = 8000.0   
@@ -19,7 +19,13 @@ MAX_STRETCH_MCAP   = 15000.0
 
 TOTAL_EVENTS = 0
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 3000
+MAX_TRACKED = 5000
+
+def safe_float(value) -> float:
+    try:
+        return float(value) if value is not None else 0.0
+    except:
+        return 0.0
 
 def register_token(mint: str):
     if mint not in tracked_tokens:
@@ -48,49 +54,61 @@ async def pumpportal_listener():
 
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                # On s'abonne aux créations ET aux trades pour voir le prix monter
+            # Augmentation de la taille de réception pour éviter les coupures sur les gros blocs de données
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=10, max_size=10_000_000) as websocket:
+                
+                # Abonnement aux créations ET aux trades pour capter la hausse des prix
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 await websocket.send(json.dumps({"method": "subscribeTokenTrade"}))
                 print("[PUMPPORTAL] Flux connecté. Écoute active...")
 
-                async for message in websocket:
+                async for raw_message in websocket:
                     TOTAL_EVENTS += 1
-                    data = json.loads(message)
                     
-                    # On récupère l'adresse (mint) du token
+                    # Correction du bug d'encodage : décodage sécurisé que ce soit du texte ou du binaire
+                    if isinstance(raw_message, bytes):
+                        message_str = raw_message.decode('utf-8', errors='ignore')
+                    else:
+                        message_str = raw_message
+
+                    try:
+                        data = json.loads(message_str)
+                    except json.JSONDecodeError:
+                        continue
+                    
                     mint = data.get("mint")
                     if not mint:
                         continue
 
-                    # On enregistre le token s'il vient de naître
-                    if data.get("txType") == "create":
+                    tx_type = data.get("txType")
+
+                    # Enregistrement à la naissance
+                    if tx_type == "create":
                         register_token(mint)
                         continue
 
-                    # Si c'est un Trade, on extrait directement le Market Cap fourni par PumpPortal
-                    if data.get("txType") in ["buy", "sell"]:
+                    # Analyse fine des achats / ventes
+                    if tx_type in ["buy", "sell"]:
                         register_token(mint)
                         token_info = tracked_tokens[mint]
                         
                         if token_info["alerted"]:
                             continue
 
-                        # Calcul direct du Market Cap en USD via les données de PumpPortal
+                        # Calcul dynamique du Market Cap
                         mcap_sol = safe_float(data.get("marketCapSol"))
                         mcap_usd = mcap_sol * SOL_PRICE_USD
 
-                        # Si le mcap calculé est à 0, on utilise leur fallback en USD direct
                         if mcap_usd == 0:
                             mcap_usd = safe_float(data.get("usdMarketCap"))
 
-                        # On vérifie si le token vient de franchir la zone Stretch !
+                        # Validation de la zone Stretch Axiom Pro
                         if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
                             token_info["alerted"] = True
                             elapsed = time.time() - token_info["created_at"]
                             time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
 
-                            print(f"🔥 [DÉTECTION] Token {mint} est entré dans la zone Stretch : {mcap_usd:,.0f}$")
+                            print(f"🔥 [DÉTECTION] Token {mint} -> {mcap_usd:,.0f}$")
 
                             msg = (
                                 f"⚡ <b>PAIRE EN EXPLOSION (STRETCH ZONE)</b> ⚡\n\n"
@@ -104,12 +122,9 @@ async def pumpportal_listener():
                             asyncio.create_task(send_telegram_alert(msg))
 
         except Exception as e:
-            print(f"[RETRY] Déconnexion flux ({e}). Réexpédition dans 4s...")
+            # Affiche l'erreur exacte dans Railway pour le suivi sans bloquer l'application
+            print(f"[PUMPPORTAL RETRY] Erreur de flux : {e}. Réexpédition dans 4s...")
             await asyncio.sleep(4)
-
-def safe_float(value) -> float:
-    try: return float(value) if value else 0.0
-    except: return 0.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

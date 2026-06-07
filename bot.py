@@ -9,24 +9,26 @@ from collections import OrderedDict
 import time
  
 # ─── CONFIGURATION ───
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "61.73"))
+TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+SOL_PRICE_USD       = float(os.getenv("SOL_PRICE_USD", "61.73"))
  
 # 🎯 ZONE STRETCH AXIOM PRO
-MIN_STRETCH_MCAP   = 8000.0
-MAX_STRETCH_MCAP   = 15000.0
+MIN_STRETCH_MCAP    = 8000.0
+MAX_STRETCH_MCAP    = 15000.0
  
 # ⏱️ Ignorer les tokens trop vieux (> 10 min)
-MAX_TOKEN_AGE_SEC  = 600
+MAX_TOKEN_AGE_SEC   = 600
  
-# 🔎 Filtre création : achat initial minimum en SOL pour souscrire aux trades
+# 🔎 Filtre création : achat initial minimum en SOL
 MIN_INITIAL_BUY_SOL = 0.3
  
 TOTAL_EVENTS  = 0
-TOTAL_TRACKED = 0
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 2000
+MAX_TRACKED   = 2000
+ 
+# File partagée entre les deux connexions WebSocket
+pending_subscriptions: asyncio.Queue = None
  
 def safe_float(value) -> float:
     try:
@@ -35,16 +37,14 @@ def safe_float(value) -> float:
         return 0.0
  
 def register_token(mint: str):
-    global TOTAL_TRACKED
     if mint not in tracked_tokens:
         if len(tracked_tokens) >= MAX_TRACKED:
             tracked_tokens.popitem(last=False)
         tracked_tokens[mint] = {"created_at": time.time(), "alerted": False}
-        TOTAL_TRACKED += 1
  
 async def send_telegram_alert(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TG] Token ou Chat ID manquant — alerte non envoyée", flush=True)
+        print("[TG] Token ou Chat ID manquant", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -60,112 +60,134 @@ async def send_telegram_alert(message: str):
     except Exception as e:
         print(f"[TG ERROR] {e}", flush=True)
  
-async def pumpportal_listener():
+# ─── CONNEXION 1 : écoute des nouveaux tokens ───────────────────────────────
+async def listener_new_tokens():
     global TOTAL_EVENTS
     uri = "wss://pumpportal.fun/api/data"
  
-    print("=== [BOT] Connexion au flux direct PumpPortal ===", flush=True)
-    await asyncio.sleep(1)
-    await send_telegram_alert("⚡ <b>Flux STRETCH connecté (PumpPortal)</b> — Écoute du marché en cours...")
- 
     while True:
         try:
-            async with websockets.connect(
-                uri,
-                ping_interval=20,
-                ping_timeout=10,
-                max_size=10_000_000
-            ) as websocket:
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=10, max_size=10_000_000) as ws:
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                print("[NEW_TOKENS] Connexion active — écoute des créations...", flush=True)
  
-                await websocket.send(json.dumps({"method": "subscribeNewToken"}))
-                print("[PUMPPORTAL] Flux connecté. Écoute active...", flush=True)
- 
-                async for raw_message in websocket:
+                async for raw in ws:
                     TOTAL_EVENTS += 1
- 
-                    if isinstance(raw_message, bytes):
-                        message_str = raw_message.decode('utf-8', errors='ignore')
-                    else:
-                        message_str = raw_message
- 
                     try:
-                        data = json.loads(message_str)
-                    except json.JSONDecodeError:
+                        data = json.loads(raw if isinstance(raw, str) else raw.decode('utf-8', errors='ignore'))
+                    except:
+                        continue
+ 
+                    if data.get("txType") != "create":
                         continue
  
                     mint = data.get("mint")
                     if not mint:
                         continue
  
-                    tx_type = data.get("txType")
+                    initial_buy = safe_float(data.get("solAmount"))
  
-                    # ── CRÉATION ──
-                    if tx_type == "create":
-                        initial_buy_sol = safe_float(data.get("solAmount"))
+                    if initial_buy < MIN_INITIAL_BUY_SOL:
+                        print(f"[SKIP] {mint[:12]}... initialBuy={initial_buy:.3f} SOL", flush=True)
+                        continue
  
-                        # Filtre : ne tracker que les tokens avec un achat initial significatif
-                        if initial_buy_sol < MIN_INITIAL_BUY_SOL:
-                            print(f"[SKIP] {mint[:12]}... initialBuy={initial_buy_sol:.3f} SOL < seuil", flush=True)
-                            continue
+                    register_token(mint)
+                    await pending_subscriptions.put(mint)
+                    print(f"[CREATE] ✅ {mint[:12]}... initialBuy={initial_buy:.3f} SOL → en file", flush=True)
  
-                        register_token(mint)
-                        await websocket.send(json.dumps({
+        except Exception as e:
+            print(f"[NEW_TOKENS RETRY] {e} — reconnexion dans 4s...", flush=True)
+            await asyncio.sleep(4)
+ 
+# ─── CONNEXION 2 : écoute des trades des tokens filtrés ─────────────────────
+async def listener_trades():
+    global TOTAL_EVENTS
+    uri = "wss://pumpportal.fun/api/data"
+ 
+    while True:
+        try:
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=10, max_size=10_000_000) as ws:
+                print("[TRADES] Connexion active — en attente de tokens à tracker...", flush=True)
+ 
+                async def subscribe_loop():
+                    while True:
+                        mint = await pending_subscriptions.get()
+                        await ws.send(json.dumps({
                             "method": "subscribeTokenTrade",
                             "keys": [mint]
                         }))
-                        print(f"[CREATE] ✅ {mint[:12]}... initialBuy={initial_buy_sol:.3f} SOL — trade activé", flush=True)
+                        print(f"[TRADES] Subscribed → {mint[:12]}...", flush=True)
+ 
+                asyncio.create_task(subscribe_loop())
+ 
+                async for raw in ws:
+                    TOTAL_EVENTS += 1
+                    try:
+                        data = json.loads(raw if isinstance(raw, str) else raw.decode('utf-8', errors='ignore'))
+                    except:
                         continue
  
-                    # ── TRADES ──
-                    if tx_type in ["buy", "sell"]:
-                        if mint not in tracked_tokens:
-                            continue  # token non tracké, on ignore
+                    tx_type = data.get("txType")
+                    if tx_type not in ["buy", "sell"]:
+                        continue
  
-                        token_info = tracked_tokens[mint]
+                    mint = data.get("mint")
+                    if not mint or mint not in tracked_tokens:
+                        continue
  
-                        if token_info["alerted"]:
-                            continue
+                    token_info = tracked_tokens[mint]
  
-                        age = time.time() - token_info["created_at"]
-                        if age > MAX_TOKEN_AGE_SEC:
-                            continue
+                    if token_info["alerted"]:
+                        continue
  
-                        mcap_sol = safe_float(data.get("marketCapSol"))
-                        mcap_usd = mcap_sol * SOL_PRICE_USD
+                    age = time.time() - token_info["created_at"]
+                    if age > MAX_TOKEN_AGE_SEC:
+                        continue
  
-                        if mcap_usd == 0:
-                            mcap_usd = safe_float(data.get("usdMarketCap"))
+                    mcap_sol = safe_float(data.get("marketCapSol"))
+                    mcap_usd = mcap_sol * SOL_PRICE_USD
+                    if mcap_usd == 0:
+                        mcap_usd = safe_float(data.get("usdMarketCap"))
  
-                        if mcap_usd > 0:
-                            print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (age={age:.0f}s {tx_type})", flush=True)
+                    if mcap_usd > 0:
+                        print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (age={age:.0f}s {tx_type})", flush=True)
  
-                        # 🎯 STRETCH ZONE
-                        if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
-                            token_info["alerted"] = True
-                            time_str = f"{int(age // 60)}m {int(age % 60)}s" if age >= 60 else f"{age:.0f}s"
+                    # 🎯 STRETCH ZONE
+                    if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
+                        token_info["alerted"] = True
+                        time_str = f"{int(age // 60)}m {int(age % 60)}s" if age >= 60 else f"{age:.0f}s"
  
-                            print(f"🔥 [DÉTECTION] {mint} -> {mcap_usd:,.0f}$ en {time_str}", flush=True)
+                        print(f"🔥 [DÉTECTION] {mint} → {mcap_usd:,.0f}$ en {time_str}", flush=True)
  
-                            msg = (
-                                f"⚡ <b>PAIRE EN EXPLOSION (STRETCH ZONE)</b> ⚡\n\n"
-                                f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-                                f"• <b>Âge au Stretch :</b> <code>{time_str}</code> 🔥\n\n"
-                                f"📊 <b>Outils :</b>\n"
-                                f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
-                                f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
-                                f"📥 <b>CA :</b> <code>{mint}</code>"
-                            )
-                            asyncio.create_task(send_telegram_alert(msg))
+                        msg = (
+                            f"⚡ <b>PAIRE EN EXPLOSION (STRETCH ZONE)</b> ⚡\n\n"
+                            f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
+                            f"• <b>Âge au Stretch :</b> <code>{time_str}</code> 🔥\n\n"
+                            f"📊 <b>Outils :</b>\n"
+                            f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
+                            f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
+                            f"📥 <b>CA :</b> <code>{mint}</code>"
+                        )
+                        asyncio.create_task(send_telegram_alert(msg))
  
         except Exception as e:
-            print(f"[PUMPPORTAL RETRY] Erreur de flux : {e}. Réexpédition dans 4s...", flush=True)
+            print(f"[TRADES RETRY] {e} — reconnexion dans 4s...", flush=True)
             await asyncio.sleep(4)
  
+# ─── STARTUP ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(pumpportal_listener())
+    global pending_subscriptions
+    pending_subscriptions = asyncio.Queue()
+ 
+    print("=== [BOT] Démarrage — 2 connexions PumpPortal ===", flush=True)
+    await send_telegram_alert("⚡ <b>Flux STRETCH connecté (PumpPortal)</b> — Écoute du marché en cours...")
+ 
+    t1 = asyncio.create_task(listener_new_tokens())
+    t2 = asyncio.create_task(listener_trades())
     yield
-    task.cancel()
+    t1.cancel()
+    t2.cancel()
  
 app = FastAPI(lifespan=lifespan)
  
@@ -175,5 +197,5 @@ def home():
         "status": "online",
         "events_processed": TOTAL_EVENTS,
         "tracked_tokens": len(tracked_tokens),
-        "total_tracked_ever": TOTAL_TRACKED
+        "pending_subs": pending_subscriptions.qsize() if pending_subscriptions else 0
     }

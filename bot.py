@@ -23,11 +23,11 @@ MAX_TOKEN_AGE_SEC   = 600
 # 🔎 Filtre création : achat initial minimum en SOL
 MIN_INITIAL_BUY_SOL = 0.3
  
-TOTAL_EVENTS  = 0
+TOTAL_EVENTS   = 0
+TRADES_RECEIVED = 0
 tracked_tokens = OrderedDict()
-MAX_TRACKED   = 2000
+MAX_TRACKED    = 2000
  
-# File partagée entre les deux connexions WebSocket
 pending_subscriptions: asyncio.Queue = None
  
 def safe_float(value) -> float:
@@ -60,7 +60,7 @@ async def send_telegram_alert(message: str):
     except Exception as e:
         print(f"[TG ERROR] {e}", flush=True)
  
-# ─── CONNEXION 1 : écoute des nouveaux tokens ───────────────────────────────
+# ─── CONNEXION 1 : nouveaux tokens ──────────────────────────────────────────
 async def listener_new_tokens():
     global TOTAL_EVENTS
     uri = "wss://pumpportal.fun/api/data"
@@ -69,7 +69,7 @@ async def listener_new_tokens():
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10, max_size=10_000_000) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                print("[NEW_TOKENS] Connexion active — écoute des créations...", flush=True)
+                print("[NEW_TOKENS] Connexion active...", flush=True)
  
                 async for raw in ws:
                     TOTAL_EVENTS += 1
@@ -88,8 +88,7 @@ async def listener_new_tokens():
                     initial_buy = safe_float(data.get("solAmount"))
  
                     if initial_buy < MIN_INITIAL_BUY_SOL:
-                        print(f"[SKIP] {mint[:12]}... initialBuy={initial_buy:.3f} SOL", flush=True)
-                        continue
+                        continue  # silencieux pour ne pas spammer
  
                     register_token(mint)
                     await pending_subscriptions.put(mint)
@@ -99,15 +98,15 @@ async def listener_new_tokens():
             print(f"[NEW_TOKENS RETRY] {e} — reconnexion dans 4s...", flush=True)
             await asyncio.sleep(4)
  
-# ─── CONNEXION 2 : écoute des trades des tokens filtrés ─────────────────────
+# ─── CONNEXION 2 : trades des tokens filtrés ────────────────────────────────
 async def listener_trades():
-    global TOTAL_EVENTS
+    global TOTAL_EVENTS, TRADES_RECEIVED
     uri = "wss://pumpportal.fun/api/data"
  
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10, max_size=10_000_000) as ws:
-                print("[TRADES] Connexion active — en attente de tokens à tracker...", flush=True)
+                print("[TRADES] Connexion active...", flush=True)
  
                 async def subscribe_loop():
                     while True:
@@ -122,32 +121,35 @@ async def listener_trades():
  
                 async for raw in ws:
                     TOTAL_EVENTS += 1
+                    TRADES_RECEIVED += 1
+ 
                     try:
                         data = json.loads(raw if isinstance(raw, str) else raw.decode('utf-8', errors='ignore'))
                     except:
                         continue
  
+                    # ✅ Log brut de TOUT ce qui arrive sur la connexion trades
                     tx_type = data.get("txType")
+                    mint    = data.get("mint", "")
+                    mcap_sol = safe_float(data.get("marketCapSol"))
+                    mcap_usd = mcap_sol * SOL_PRICE_USD
+                    if mcap_usd == 0:
+                        mcap_usd = safe_float(data.get("usdMarketCap"))
+ 
+                    print(f"[TRADE_RAW] txType={tx_type} mint={mint[:12]}... mcap={mcap_usd:,.0f}$ keys={list(data.keys())[:5]}", flush=True)
+ 
                     if tx_type not in ["buy", "sell"]:
                         continue
- 
-                    mint = data.get("mint")
                     if not mint or mint not in tracked_tokens:
                         continue
  
                     token_info = tracked_tokens[mint]
- 
                     if token_info["alerted"]:
                         continue
  
                     age = time.time() - token_info["created_at"]
                     if age > MAX_TOKEN_AGE_SEC:
                         continue
- 
-                    mcap_sol = safe_float(data.get("marketCapSol"))
-                    mcap_usd = mcap_sol * SOL_PRICE_USD
-                    if mcap_usd == 0:
-                        mcap_usd = safe_float(data.get("usdMarketCap"))
  
                     if mcap_usd > 0:
                         print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (age={age:.0f}s {tx_type})", flush=True)
@@ -196,6 +198,7 @@ def home():
     return {
         "status": "online",
         "events_processed": TOTAL_EVENTS,
+        "trades_received": TRADES_RECEIVED,
         "tracked_tokens": len(tracked_tokens),
         "pending_subs": pending_subscriptions.qsize() if pending_subscriptions else 0
     }

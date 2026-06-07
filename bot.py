@@ -17,6 +17,9 @@ SOL_PRICE_USD      = float(os.getenv("SOL_PRICE_USD", "61.73"))
 MIN_STRETCH_MCAP   = 8000.0
 MAX_STRETCH_MCAP   = 15000.0
  
+# ⏱️ Ignorer les tokens trop vieux (> 10 min)
+MAX_TOKEN_AGE_SEC  = 600
+ 
 TOTAL_EVENTS = 0
 tracked_tokens = OrderedDict()
 MAX_TRACKED = 5000
@@ -68,7 +71,7 @@ async def pumpportal_listener():
                 max_size=10_000_000
             ) as websocket:
  
-                # ✅ Seulement subscribeNewToken — contient déjà le mcap initial
+                # Souscrire aux nouvelles créations de tokens
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 print("[PUMPPORTAL] Flux connecté. Écoute active...", flush=True)
  
@@ -85,41 +88,55 @@ async def pumpportal_listener():
                     except json.JSONDecodeError:
                         continue
  
-                    # ✅ Log brut pour confirmer la réception des données
-                    print(f"[RAW] txType={data.get('txType')} mint={str(data.get('mint',''))[:12]}... keys={list(data.keys())[:6]}", flush=True)
- 
                     mint = data.get("mint")
                     if not mint:
                         continue
  
                     tx_type = data.get("txType")
  
-                    # ✅ On analyse create, buy ET sell
-                    if tx_type in ["create", "buy", "sell"]:
+                    # ── CRÉATION : enregistrer + souscrire aux trades de ce token ──
+                    if tx_type == "create":
                         register_token(mint)
+                        # Souscrire dynamiquement aux trades de ce mint
+                        await websocket.send(json.dumps({
+                            "method": "subscribeTokenTrade",
+                            "keys": [mint]
+                        }))
+                        print(f"[CREATE] Nouveau token {mint[:12]}... — subscription trade activée", flush=True)
+                        continue
+ 
+                    # ── TRADES : vérifier si le token entre dans la Stretch Zone ──
+                    if tx_type in ["buy", "sell"]:
+                        if mint not in tracked_tokens:
+                            register_token(mint)
+ 
                         token_info = tracked_tokens[mint]
  
+                        # Ignorer si déjà alerté
                         if token_info["alerted"]:
                             continue
  
-                        # Calcul dynamique du Market Cap
+                        # Ignorer les tokens trop vieux
+                        age = time.time() - token_info["created_at"]
+                        if age > MAX_TOKEN_AGE_SEC:
+                            continue
+ 
+                        # Calcul du Market Cap
                         mcap_sol = safe_float(data.get("marketCapSol"))
                         mcap_usd = mcap_sol * SOL_PRICE_USD
  
                         if mcap_usd == 0:
                             mcap_usd = safe_float(data.get("usdMarketCap"))
  
-                        # ✅ Log mcap reçu même hors zone
                         if mcap_usd > 0:
-                            print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (txType={tx_type})", flush=True)
+                            print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (age={age:.0f}s txType={tx_type})", flush=True)
  
-                        # Validation zone Stretch
+                        # 🎯 STRETCH ZONE DÉTECTÉE
                         if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
                             token_info["alerted"] = True
-                            elapsed = time.time() - token_info["created_at"]
-                            time_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+                            time_str = f"{int(age // 60)}m {int(age % 60)}s" if age >= 60 else f"{age:.0f}s"
  
-                            print(f"🔥 [DÉTECTION] Token {mint} -> {mcap_usd:,.0f}$", flush=True)
+                            print(f"🔥 [DÉTECTION] Token {mint} -> {mcap_usd:,.0f}$ en {time_str}", flush=True)
  
                             msg = (
                                 f"⚡ <b>PAIRE EN EXPLOSION (STRETCH ZONE)</b> ⚡\n\n"

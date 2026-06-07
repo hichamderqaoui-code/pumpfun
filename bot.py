@@ -20,9 +20,13 @@ MAX_STRETCH_MCAP   = 15000.0
 # ⏱️ Ignorer les tokens trop vieux (> 10 min)
 MAX_TOKEN_AGE_SEC  = 600
  
-TOTAL_EVENTS = 0
+# 🔎 Filtre création : achat initial minimum en SOL pour souscrire aux trades
+MIN_INITIAL_BUY_SOL = 0.3
+ 
+TOTAL_EVENTS  = 0
+TOTAL_TRACKED = 0
 tracked_tokens = OrderedDict()
-MAX_TRACKED = 5000
+MAX_TRACKED = 2000
  
 def safe_float(value) -> float:
     try:
@@ -31,10 +35,12 @@ def safe_float(value) -> float:
         return 0.0
  
 def register_token(mint: str):
+    global TOTAL_TRACKED
     if mint not in tracked_tokens:
         if len(tracked_tokens) >= MAX_TRACKED:
             tracked_tokens.popitem(last=False)
         tracked_tokens[mint] = {"created_at": time.time(), "alerted": False}
+        TOTAL_TRACKED += 1
  
 async def send_telegram_alert(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -71,7 +77,6 @@ async def pumpportal_listener():
                 max_size=10_000_000
             ) as websocket:
  
-                # Souscrire aux nouvelles créations de tokens
                 await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                 print("[PUMPPORTAL] Flux connecté. Écoute active...", flush=True)
  
@@ -94,34 +99,37 @@ async def pumpportal_listener():
  
                     tx_type = data.get("txType")
  
-                    # ── CRÉATION : enregistrer + souscrire aux trades de ce token ──
+                    # ── CRÉATION ──
                     if tx_type == "create":
+                        initial_buy_sol = safe_float(data.get("solAmount"))
+ 
+                        # Filtre : ne tracker que les tokens avec un achat initial significatif
+                        if initial_buy_sol < MIN_INITIAL_BUY_SOL:
+                            print(f"[SKIP] {mint[:12]}... initialBuy={initial_buy_sol:.3f} SOL < seuil", flush=True)
+                            continue
+ 
                         register_token(mint)
-                        # Souscrire dynamiquement aux trades de ce mint
                         await websocket.send(json.dumps({
                             "method": "subscribeTokenTrade",
                             "keys": [mint]
                         }))
-                        print(f"[CREATE] Nouveau token {mint[:12]}... — subscription trade activée", flush=True)
+                        print(f"[CREATE] ✅ {mint[:12]}... initialBuy={initial_buy_sol:.3f} SOL — trade activé", flush=True)
                         continue
  
-                    # ── TRADES : vérifier si le token entre dans la Stretch Zone ──
+                    # ── TRADES ──
                     if tx_type in ["buy", "sell"]:
                         if mint not in tracked_tokens:
-                            register_token(mint)
+                            continue  # token non tracké, on ignore
  
                         token_info = tracked_tokens[mint]
  
-                        # Ignorer si déjà alerté
                         if token_info["alerted"]:
                             continue
  
-                        # Ignorer les tokens trop vieux
                         age = time.time() - token_info["created_at"]
                         if age > MAX_TOKEN_AGE_SEC:
                             continue
  
-                        # Calcul du Market Cap
                         mcap_sol = safe_float(data.get("marketCapSol"))
                         mcap_usd = mcap_sol * SOL_PRICE_USD
  
@@ -129,14 +137,14 @@ async def pumpportal_listener():
                             mcap_usd = safe_float(data.get("usdMarketCap"))
  
                         if mcap_usd > 0:
-                            print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (age={age:.0f}s txType={tx_type})", flush=True)
+                            print(f"[MCAP] {mint[:12]}... = {mcap_usd:,.0f}$ (age={age:.0f}s {tx_type})", flush=True)
  
-                        # 🎯 STRETCH ZONE DÉTECTÉE
+                        # 🎯 STRETCH ZONE
                         if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
                             token_info["alerted"] = True
                             time_str = f"{int(age // 60)}m {int(age % 60)}s" if age >= 60 else f"{age:.0f}s"
  
-                            print(f"🔥 [DÉTECTION] Token {mint} -> {mcap_usd:,.0f}$ en {time_str}", flush=True)
+                            print(f"🔥 [DÉTECTION] {mint} -> {mcap_usd:,.0f}$ en {time_str}", flush=True)
  
                             msg = (
                                 f"⚡ <b>PAIRE EN EXPLOSION (STRETCH ZONE)</b> ⚡\n\n"
@@ -166,5 +174,6 @@ def home():
     return {
         "status": "online",
         "events_processed": TOTAL_EVENTS,
-        "tracked": len(tracked_tokens)
+        "tracked_tokens": len(tracked_tokens),
+        "total_tracked_ever": TOTAL_TRACKED
     }

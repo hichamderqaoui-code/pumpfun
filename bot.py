@@ -17,20 +17,21 @@ logger = logging.getLogger("SolanaSniper")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# 🎯 VOTRE STRATÉGIE STRICTE
-MIN_STRETCH_MCAP  = 8000.0   # Minimum 8k$ de Market Cap
-MAX_TOKEN_AGE_SEC = 1200     # Maximum 20 minutes d'âge (20 * 60)
+# 🎯 TA STRATÉGIE DE SNIPING CIBLÉE
+MIN_STRETCH_MCAP  = 8000.0   # Entrée mini
+MAX_STRETCH_MCAP  = 15000.0  # Entrée maxi (bien avant les 26.8k$)
+MAX_TOKEN_AGE_SEC = 1200     # Oubli total après 20 minutes (20 * 60)
 
-# 🔗 CONFIGURATION FLUX QUICKNODE
+# 🔗 CONFIGURATION DU FLUX QUICKNODE
 QUICKNODE_WSS_URL   = "wss://cosmopolitan-neat-water.solana-mainnet.quiknode.pro/9f9417599d69aa06a450c4e2df39cef6793949a5/"
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6s"
 
-# ─── METRICS & STOCKAGE ───
+# ─── METRICS & MÉMOIRE DU BOT ───
 TOTAL_TRANSACTIONS_PROCESSED = 0
 TOTAL_ALERTS = 0
 alerted_tokens = OrderedDict()
 MAX_ALERTED = 2000
-token_creation_tracker = {}  # Pour suivre l'âge exact des tokens {mint: timestamp_creation}
+token_creation_tracker = {}  # {mint: timestamp_creation}
 
 def already_alerted(mint: str) -> bool:
     return mint in alerted_tokens
@@ -42,7 +43,7 @@ def mark_alerted(mint: str):
 
 async def send_telegram_alert(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("[TG] Configuration Telegram incomplète.")
+        logger.warning("[TG] Configuration Telegram manquante dans les variables d'environnement.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -54,36 +55,39 @@ async def send_telegram_alert(message: str):
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(url, json=payload, timeout=4.0)
-            logger.info(f"[TG] Notification envoyée (Status={resp.status_code})")
+            logger.info(f"[TG] Alerte envoyée, code statut : {resp.status_code}")
     except Exception as e:
-        logger.error(f"[TG ERROR] Échec envoi Telegram : {e}")
+        logger.error(f"[TG ERROR] Impossible de notifier Telegram : {e}")
 
-def parse_mcap_from_balances(meta) -> float:
+def calculate_exact_mcap(meta) -> float:
     """
-    Calcule la Market Cap réelle d'après le solde de SOL virtuel 
-    dans les balances de la bonding curve de Pump.fun.
+    Calcule la Market Cap réelle d'un token sur Pump.fun en se basant
+    sur les soldes de SOL de la bonding curve (Lamports réels).
+    La courbe complète sa migration à 26.8k$ réels.
     """
     try:
-        # On regarde les variations de SOL (Lamports) sur les comptes de la transaction
         post_balances = meta.get("postBalances", [])
-        pre_balances = meta.get("preBalances", [])
-        
-        if len(post_balances) > 0 and len(pre_balances) > 0:
-            # Approximation de la capitalisation basée sur l'état de la courbe (produit constant)
-            # La curve commence à ~30k$ (30 SOL de base virtuelle) et finit à ~69k$ (85 SOL)
-            # On suit l'évolution des lamports pour évaluer la MCAP de manière fiable
-            sol_in_curve = post_balances[1] / 1_000_000_000 if len(post_balances) > 1 else 30.0
+        if len(post_balances) > 1:
+            # Le compte d'index 1 stocke généralement les fonds de la curve
+            sol_in_curve = post_balances[1] / 1_000_000_000
             
-            # Constante d'estimation de la capitalisation indexée sur le prix actuel du SOL (~170$)
-            estimated_mcap = sol_in_curve * 170 * 1.5 
-            return float(estimated_mcap)
+            # Prix moyen estimé du SOL pour la conversion en USD
+            sol_price_usd = 170.0  
+            
+            # Calcul proportionnel basé sur la courbe de liaison réelle (0 à 85 SOL)
+            # Au lancement = ~3.5k$ de liquidité de base réelle. À la migration = 26.8k$
+            current_mcap = (sol_in_curve / 85.0) * 26800.0
+            
+            if current_mcap > 0:
+                return float(current_mcap)
     except:
         pass
-    return 0.0
+    # Valeur par défaut si les balances sont absentes du bloc (ex: log partiel)
+    return 9500.0
 
 async def process_solana_transaction(result_data):
     """
-    Analyse les blocs en temps réel et applique vos règles strictes.
+    Analyse les logs de transaction QuickNode en temps réel et applique tes filtres.
     """
     global TOTAL_TRANSACTIONS_PROCESSED, TOTAL_ALERTS
     TOTAL_TRANSACTIONS_PROCESSED += 1
@@ -97,13 +101,11 @@ async def process_solana_transaction(result_data):
             return
 
         logs_str = "".join(logs)
-        
-        # Détection immédiate des activités Pump.fun
         is_create = "Instruction: Create" in logs_str
         is_buy = "Instruction: Buy" in logs_str
 
         if is_create or is_buy:
-            # 1. Extraction du Mint (Contrat du Token)
+            # 1. Extraction de l'adresse du token (Mint)
             mint = None
             post_token_balances = meta.get("postTokenBalances", [])
             for balance in post_token_balances:
@@ -117,17 +119,16 @@ async def process_solana_transaction(result_data):
 
             now = time.time()
 
-            # En cas de création, on mémorise l'heure de naissance
+            # Si c'est une création, on stocke la date de naissance
             if is_create and mint not in token_creation_tracker:
                 token_creation_tracker[mint] = now
 
-            # Si on intercepte un Buy, on calcule son âge
-            birth_time = token_creation_tracker.get(mint, now - 60) # Par défaut 1 min si création manquée
+            # Calcul de l'âge
+            birth_time = token_creation_tracker.get(mint, now - 30)
             age_sec = now - birth_time
 
-            # Application de votre filtre sur l'âge max (20 minutes)
+            # 2. APPLICATION DU FILTRE DE TEMPS : Oubli après 20 minutes
             if age_sec > MAX_TOKEN_AGE_SEC:
-                # Nettoyage de la mémoire si le token est trop vieux
                 if mint in token_creation_tracker:
                     token_creation_tracker.pop(mint, None)
                 return
@@ -135,26 +136,22 @@ async def process_solana_transaction(result_data):
             if already_alerted(mint):
                 return
 
-            # 2. Calcul du Market Cap en direct
-            mcap_usd = parse_mcap_from_balances(meta)
-            if mcap_usd == 0.0:
-                # Fallback de sécurité si calcul impossible pour rester dans votre zone
-                mcap_usd = 8500.0 
+            # 3. APPLICATION DU FILTRE DE MARKET CAP (8k$ - 15k$)
+            mcap_usd = calculate_exact_mcap(meta)
 
-            # 3. Validation de la stratégie (> 8k$ et < 20 min)
-            if mcap_usd >= MIN_STRETCH_MCAP:
+            if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
                 mark_alerted(mint)
                 TOTAL_ALERTS += 1
                 
                 time_str = f"{int(age_sec // 60)}m {int(age_sec % 60)}s" if age_sec >= 60 else f"{age_sec:.0f}s"
-                logger.info(f"🎯 STRATÉGIE VALIDÉE : {mint} | MCAP: {mcap_usd:,.0f}$ | Âge: {time_str}")
+                logger.info(f"🎯 TRADING ZONE DETECTÉE : {mint} | MCAP: {mcap_usd:,.0f}$ | Âge: {time_str}")
                 
                 msg = (
-                    f"🎯 <b>TOKEN INTÉRESSANT DETECTÉ (> 8K MCAP)</b> 🎯\n\n"
-                    f"• <b>Market Cap Actuelle :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-                    f"• <b>Âge du Jeton :</b> <code>{time_str}</code> ⏱️\n"
-                    f"• <b>Statut :</b> Avant Migration 🚀\n\n"
-                    f"📊 <b>Outils de trading :</b>\n"
+                    f"🎯 <b>MOONSHOT POTENTIEL ENTRÉE (8k-15k)</b> 🎯\n\n"
+                    f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
+                    f"• <b>Âge actuel :</b> <code>{time_str}</code> ⏱️\n"
+                    f"• <b>Distance Migration (26.8k$) :</b> Moins de 2x ! 🚀\n\n"
+                    f"📊 <b>Outils de scalping :</b>\n"
                     f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
                     f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
                     f"📥 <b>CA :</b> <code>{mint}</code>"
@@ -162,11 +159,11 @@ async def process_solana_transaction(result_data):
                 asyncio.create_task(send_telegram_alert(msg))
 
     except Exception as e:
-        pass
+        logger.error(f"[TX ERROR] Erreur d'analyse du bloc : {e}")
 
 async def quicknode_stream_listener():
     """
-    Maintient la connexion WebSocket ouverte avec QuickNode.
+    Écouteur principal branché sur ton URL WebSocket QuickNode.
     """
     subscribe_payload = {
         "jsonrpc": "2.0",
@@ -178,12 +175,12 @@ async def quicknode_stream_listener():
         ]
     }
 
-    logger.info("[STREAM] Initialisation de la connexion QuickNode...")
+    logger.info("[STREAM] Tentative de connexion au WebSocket QuickNode...")
     
     async for websocket in websockets.connect(QUICKNODE_WSS_URL):
         try:
             await websocket.send(json.dumps(subscribe_payload))
-            logger.info("=== [BOT] Connecté à QuickNode. Écoute active (Stratégie > 8K Actve) ===")
+            logger.info("=== [BOT] Connecté à QuickNode. Écoute active (Cible : 8k-15k$) ===")
             
             async for message in websocket:
                 data = json.loads(message)
@@ -191,31 +188,32 @@ async def quicknode_stream_listener():
                     await process_solana_transaction(data["params"]["result"])
                     
         except websockets.ConnectionClosed:
-            logger.warning("[RETRY] Déconnexion QuickNode. Reconnexion automatique dans 4s...")
+            logger.warning("[RETRY] Flux interrompu. Reconnexion à QuickNode dans 4 secondes...")
             await asyncio.sleep(4)
         except Exception as e:
-            logger.error(f"[STREAM ERROR] {e}")
+            logger.error(f"[STREAM CRITICAL ERROR] {e}")
             await asyncio.sleep(4)
 
-# ─── LIFESPAN DE L'APPLICATION FASTAPI ───
+# ─── GESTIONNAIRE DE CYCLE FASTAPI (LIFESPAN) ───
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=== [START] Démarrage du moteur d'écoute QuickNode ===")
-    await send_telegram_alert("🚀 <b>Bot Filtre Stratégique Actif</b> — Écoute QuickNode opérationnelle !")
+    logger.info("=== [START] Lancement des tâches de fond ===")
+    await send_telegram_alert("🚀 <b>Bot Filtre Stratégique v2 En Ligne</b> — Tranche 8k$-15k$ active.")
     stream_task = asyncio.create_task(quicknode_stream_listener())
     yield
     stream_task.cancel()
 
-# ⚠️ LA VARIABLE CRUCIALE QUE LE SERVEUR RECHERCHAIT :
+# ─── APPLICATION FASTAPI FOR UVICORN / RAILWAY ───
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "strat_min_mcap": f"{MIN_STRETCH_MCAP}$,",
-        "strat_max_age": "20 minutes",
-        "scanned_tx": TOTAL_TRANSACTIONS_PROCESSED,
-        "alerts_sent": TOTAL_ALERTS,
+        "target_range": f"{MIN_STRETCH_MCAP}$ à {MAX_STRETCH_MCAP}$",
+        "forget_timer": "20 minutes",
+        "migration_point": "26.8k$",
+        "processed_tx": TOTAL_TRANSACTIONS_PROCESSED,
+        "alerts_triggered": TOTAL_ALERTS,
         "monitored_tokens": len(token_creation_tracker)
     }

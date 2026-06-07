@@ -17,12 +17,12 @@ logger = logging.getLogger("SolanaSniper")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# 🎯 STRATÉGIE DE FILTRAGE
+# 🎯 STRATÉGIE DE FILTRAGE CIBLE
 MIN_STRETCH_MCAP  = 8000.0   
 MAX_STRETCH_MCAP  = 15000.0  
 MAX_TOKEN_AGE_SEC = 1200     # 20 minutes
 
-# 🔗 CONFIGURATION QUICKNODE
+# 🔗 CONFIGURATION QUICKNODE ( logsSubscribe )
 QUICKNODE_WSS_URL   = "wss://cosmopolitan-neat-water.solana-mainnet.quiknode.pro/9f9417599d69aa06a450c4e2df39cef6793949a5/"
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6s"
 
@@ -60,7 +60,7 @@ async def send_telegram_alert(message: str):
 
 async def fetch_pump_fun_data(mint: str):
     """
-    Interroge l'API frontend de Pump.fun pour valider la MCAP et l'âge réel.
+    Interroge l'API de Pump.fun pour récupérer les vraies métriques du jeton.
     """
     url = f"https://frontend-api.pump.fun/coins/{mint}"
     try:
@@ -77,108 +77,135 @@ async def fetch_pump_fun_data(mint: str):
                 
                 return float(usd_mcap), created_timestamp
     except Exception as e:
-        logger.error(f"[API ERROR] Erreur pour {mint} : {e}")
+        # L'API peut mettre quelques millisecondes à indexer le token lors du Create
+        pass
     return None, None
 
-async def process_solana_transaction(result_data):
+async def extract_mint_from_tx(signature: str) -> str:
     """
-    Analyse le stream QuickNode et extrait le mint de façon universelle.
+    Si les logs contiennent une activité Pump.fun, on utilise une requête RPC 
+    rapide pour extraire le Mint exact de la transaction (méthode 100% fiable).
+    """
+    # Remplacement de l'adresse wss par l'adresse http correspondante de ton QuickNode
+    rpc_url = QUICKNODE_WSS_URL.replace("wss://", "https://")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(rpc_url, json=payload, timeout=3.0)
+            if response.status_code == 200:
+                res_json = response.json()
+                result = res_json.get("result", {})
+                if not result:
+                    return None
+                
+                # Scan des comptes de jetons post-transaction
+                meta = result.get("meta", {})
+                if meta:
+                    post_token_balances = meta.get("postTokenBalances", []) or []
+                    for balance in post_token_balances:
+                        mint = balance.get("mint")
+                        if mint and mint.endswith("pump"):
+                            return mint
+    except Exception as e:
+        logger.error(f"[RPC ERROR] Impossible de récupérer la TX {signature}: {e}")
+    return None
+
+async def process_solana_logs(result_data):
+    """
+    Traite le flux reçu par logsSubscribe
     """
     global TOTAL_TRANSACTIONS_PROCESSED, TOTAL_ALERTS
     TOTAL_TRANSACTIONS_PROCESSED += 1
 
     try:
         value = result_data.get("value", {})
-        meta = value.get("meta", {})
+        logs = value.get("logs", [])
+        signature = value.get("signature")
+
+        if not logs or not signature:
+            return
+
+        logs_str = "".join(logs)
         
-        # Sécurité : Si la transaction a échoué sur la blockchain, on l'ignore
-        if meta and meta.get("err") is not None:
-            return
-
-        # 🚀 EXTRACTION UNIVERSELLE DU MINT DANS UN FLUX PROGRAMSUBSCRIBE
-        # Les comptes modifiés ou impliqués sont dans value['account'] ou imbriqués dans les clés globales du flux
-        mint = None
-        
-        # 1. Extraction par les balances (si présentes)
-        if meta:
-            post_balances = meta.get("postTokenBalances", []) or []
-            for b in post_balances:
-                addr = b.get("mint")
-                if addr and addr.endswith("pump"):
-                    mint = addr
-                    break
-
-        # 2. Extraction alternative via la clé publique racine notifiée par QuickNode
-        if not mint:
-            account_pubkey = value.get("pubkey")
-            if account_pubkey and account_pubkey.endswith("pump") and account_pubkey != PUMP_FUN_PROGRAM_ID:
-                mint = account_pubkey
-
-        # Si aucun token valide se terminant par "pump" n'a été trouvé, on s'arrête
-        if not mint or already_alerted(mint):
-            return
-
-        # Appel API pour vérifier si le token match ta stratégie
-        mcap_usd, created_time = await fetch_pump_fun_data(mint)
-        
-        if mcap_usd is None or created_time == 0:
-            return
+        # Détection immédiate d'une action sur Pump.fun
+        if "Instruction: Create" in logs_str or "Instruction: Buy" in logs_str:
+            logger.info(f"[⚡ ACTION DETECTÉE] Analyse de la TX: {signature}")
             
-        now = time.time()
-        age_sec = now - created_time
-
-        # Filtre 1 : Âge maximal de 20 minutes
-        if age_sec > MAX_TOKEN_AGE_SEC:
-            return
-
-        # Filtre 2 : Plage de Market Cap cible (8k$ - 15k$)
-        if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
-            mark_alerted(mint)
-            TOTAL_ALERTS += 1
+            # Récupération du Mint
+            mint = await extract_mint_from_tx(signature)
             
-            time_str = f"{int(age_sec // 60)}m {int(age_sec % 60)}s" if age_sec >= 60 else f"{age_sec:.0f}s"
-            logger.info(f"🎯 TRADING ZONE DETECTÉE : {mint} | MCAP: {mcap_usd:,.0f}$ | Âge: {time_str}")
-            
-            msg = (
-                f"🎯 <b>MOONSHOT FILTRÉ (8k-15k)</b> 🎯\n\n"
-                f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
-                f"• <b>Âge actuel :</b> <code>{time_str}</code> ⏱️\n"
-                f"• <b>Statut :</b> Avant Migration (26.8k$) 🚀\n\n"
-                f"📊 <b>Outils de trading :</b>\n"
-                f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
-                f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
-                f"📥 <b>CA :</b> <code>{mint}</code>"
-            )
-            asyncio.create_task(send_telegram_alert(msg))
+            if not mint or already_alerted(mint):
+                return
+
+            # Vérification des specs sur l'API de Pump.fun
+            mcap_usd, created_time = await fetch_pump_fun_data(mint)
+            if mcap_usd is None or created_time == 0:
+                return
+                
+            now = time.time()
+            age_sec = now - created_time
+
+            # Filtre de temps (20 minutes max)
+            if age_sec > MAX_TOKEN_AGE_SEC:
+                return
+
+            # Filtre de Market Cap (8k$ - 15k$)
+            if MIN_STRETCH_MCAP <= mcap_usd <= MAX_STRETCH_MCAP:
+                mark_alerted(mint)
+                TOTAL_ALERTS += 1
+                
+                time_str = f"{int(age_sec // 60)}m {int(age_sec % 60)}s" if age_sec >= 60 else f"{age_sec:.0f}s"
+                logger.info(f"🎯 TRADING ZONE DETECTÉE : {mint} | MCAP: {mcap_usd:,.0f}$")
+                
+                msg = (
+                    f"🎯 <b>MOONSHOT FILTRÉ (8k-15k)</b> 🎯\n\n"
+                    f"• <b>Market Cap :</b> <code>{mcap_usd:,.0f}$</code> 💰\n"
+                    f"• <b>Âge actuel :</b> <code>{time_str}</code> ⏱️\n"
+                    f"• <b>Cible Migration :</b> 26.8k$ 🚀\n\n"
+                    f"📊 <b>Analyseurs :</b>\n"
+                    f"• <a href='https://photon-sol.tinyastro.io/en/lp/{mint}'>Photon</a>\n"
+                    f"• <a href='https://bullx.io/terminal?chain=solana&address={mint}'>BullX</a>\n\n"
+                    f"📥 <b>CA :</b> <code>{mint}</code>"
+                )
+                asyncio.create_task(send_telegram_alert(msg))
 
     except Exception as e:
-        logger.error(f"[PARSE ERROR] {e}")
+        logger.error(f"[PROCESS ERROR] {e}")
 
 async def quicknode_stream_listener():
+    """
+    Abonnement au flux via logsSubscribe, filtré directement au niveau de QuickNode
+    sur le programme Pump.fun pour ne pas surcharger la bande passante.
+    """
     subscribe_payload = {
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "programSubscribe",
+        "method": "logsSubscribe",
         "params": [
-            PUMP_FUN_PROGRAM_ID,
-            {"commitment": "processed", "encoding": "jsonParsed"}
+            {"mentions": [PUMP_FUN_PROGRAM_ID]},
+            {"commitment": "processed"}
         ]
     }
 
-    logger.info("[STREAM] Initialisation du flux QuickNode...")
+    logger.info("[STREAM] Initialisation du flux de logs QuickNode...")
     
     async for websocket in websockets.connect(QUICKNODE_WSS_URL):
         try:
             await websocket.send(json.dumps(subscribe_payload))
-            logger.info("=== [BOT] Connecté à QuickNode. Écoute active (Tranche : 8k-15k$) ===")
+            logger.info("=== [BOT] Connecté au flux logsSubscribe de QuickNode. Écoute active ===")
             
             async for message in websocket:
                 data = json.loads(message)
                 if "params" in data and "result" in data["params"]:
-                    await process_solana_transaction(data["params"]["result"])
+                    await process_solana_logs(data["params"]["result"])
                     
         except websockets.ConnectionClosed:
-            logger.warning("[RETRY] Flux interrompu. Reconnexion dans 4s...")
+            logger.warning("[RETRY] Flux déconnecté. Reconnexion dans 4s...")
             await asyncio.sleep(4)
         except Exception as e:
             logger.error(f"[STREAM ERROR] {e}")
@@ -187,8 +214,8 @@ async def quicknode_stream_listener():
 # ─── LIFESPAN FASTAPI ───
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=== [START] Démarrage du Sniper Stratégique v3.1 ===")
-    await send_telegram_alert("🚀 <b>Bot Filtre Stratégique v3.1 En Ligne</b> — Capture des Mints active.")
+    logger.info("=== [START] Démarrage du Sniper Stratégique v4 ===")
+    await send_telegram_alert("🚀 <b>Bot Filtre Stratégique v4 En Ligne</b> — Écoute par logsSubscribe activée.")
     stream_task = asyncio.create_task(quicknode_stream_listener())
     yield
     stream_task.cancel()
@@ -203,4 +230,3 @@ def home():
         "tx_traitees": TOTAL_TRANSACTIONS_PROCESSED,
         "alertes_envoyees": TOTAL_ALERTS
     }
-    

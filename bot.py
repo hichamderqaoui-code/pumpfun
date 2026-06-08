@@ -23,7 +23,7 @@ MAX_TOKEN_AGE_SEC   = 1200
 MIN_INITIAL_BUY_SOL = 0.3
  
 # ⏱️ Intervalle polling (secondes)
-POLL_INTERVAL       = 15
+POLL_INTERVAL       = 5
  
 TOTAL_EVENTS = 0
 TOTAL_ALERTS = 0
@@ -168,7 +168,7 @@ async def poller():
                 except Exception as e:
                     print(f"[POLL ERROR] {mint[:12]}... {e}", flush=True)
  
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1)
  
 @asynccontextmanager
 async def lifespan(app: FastAPI):
